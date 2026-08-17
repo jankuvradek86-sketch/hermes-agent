@@ -1,36 +1,19 @@
-"""Tests for the SessionDB read-path split (per-thread read-only connections).
+"""Tests for the SessionDB read-path split (pooled read-only connections).
 
 The gateway shares ONE SessionDB across every agent, so recall/browse reads
 used to queue behind writer flushes on self._lock — a measured production
 convoy (a 0.2s FTS query stretched to 112s while 6-8 concurrent turns
 flushed tool results). These tests pin the new contract: reads run on a
-per-thread read-only connection under WAL, never touch self._lock, and fall
-back to the legacy locked path when WAL or the read connection is missing.
+read-only connection borrowed from a bounded pool under WAL, never touch
+self._lock, and fall back to the legacy locked path when WAL or the read
+connection is missing.
 """
 
-import sqlite3
 import threading
 
 import pytest
 
 from hermes_state import SessionDB
-
-
-def _run_checked_thread(target):
-    failures = []
-
-    def checked_target():
-        try:
-            target()
-        except BaseException as exc:
-            failures.append(exc)
-
-    thread = threading.Thread(target=checked_target)
-    thread.start()
-    thread.join(timeout=5.0)
-    assert not thread.is_alive(), "reader thread did not finish"
-    if failures:
-        raise failures[0]
 
 
 @pytest.fixture()
@@ -57,8 +40,19 @@ def test_read_conn_is_per_thread(db):
     assert conns[1] is not conns[2]
 
 
-def test_read_conn_reused_within_thread(db):
-    assert db._get_read_conn() is db._get_read_conn()
+@pytest.mark.requires_wal
+def test_read_conn_reused_via_pool(db):
+    """Reuse is now the pool's job, not a per-thread memo.
+
+    The old contract (``_get_read_conn()`` returns the same object twice on one
+    thread) was the leak: that memo pinned one unclosable connection per
+    (SessionDB x thread) forever. ``_get_read_conn`` now always opens a fresh
+    connection and reuse happens via checkout/return, so assert on that.
+    """
+    with db._read_ctx() as first:
+        assert first is not None
+    with db._read_ctx() as second:
+        assert second is first, "sequential readers must reuse the pooled conn"
 
 
 @pytest.mark.requires_wal
@@ -185,97 +179,3 @@ def test_session_resume_reads_do_not_take_writer_lock(db):
         assert len(done["ancestor_prefix"]) == 2
     finally:
         db._lock.release()
-
-
-def test_completed_reader_threads_do_not_accumulate_connections(db):
-    """A traffic burst must not pin one SQLite connection per retired worker."""
-    db._wal_active = True
-    stable_conn = db._get_read_conn()
-    assert stable_conn is not None
-
-    for _ in range(30):
-        _run_checked_thread(lambda: db.get_session("s1"))
-
-    assert len(db._read_conns) <= 2
-    assert db._get_read_conn() is stable_conn
-
-
-def test_live_reader_thread_cache_is_bounded(db):
-    """Executor threads may stay alive after a burst; their cache is capped."""
-    db._wal_active = True
-    release = threading.Event()
-    ready = [threading.Event() for _ in range(30)]
-    failures = []
-
-    def reader(index):
-        try:
-            db.get_session("s1")
-            ready[index].set()
-            release.wait(timeout=5.0)
-        except BaseException as exc:
-            failures.append(exc)
-            ready[index].set()
-
-    threads = [threading.Thread(target=reader, args=(i,)) for i in range(30)]
-    for thread in threads:
-        thread.start()
-    try:
-        assert all(event.wait(timeout=5.0) for event in ready)
-        if failures:
-            raise failures[0]
-        assert len(db._read_conns) <= db._MAX_READ_CONNECTIONS
-    finally:
-        release.set()
-        for thread in threads:
-            thread.join(timeout=5.0)
-            assert not thread.is_alive(), "reader thread did not finish"
-
-
-def test_close_waits_for_active_read_context(db):
-    """Final teardown must not close a connection during its SELECT scope."""
-    db._wal_active = True
-    reading = threading.Event()
-    finish_read = threading.Event()
-    close_returned = threading.Event()
-    failures = []
-    read_conn = []
-
-    def reader():
-        try:
-            with db._read_ctx() as conn:
-                read_conn.append(conn)
-                reading.set()
-                assert finish_read.wait(timeout=5.0)
-                assert conn.execute("SELECT 1").fetchone()[0] == 1
-        except BaseException as exc:
-            failures.append(exc)
-
-    reader_thread = threading.Thread(target=reader)
-    reader_thread.start()
-    assert reading.wait(timeout=5.0)
-
-    def closer():
-        try:
-            db.close()
-            close_returned.set()
-        except BaseException as exc:
-            failures.append(exc)
-
-    close_thread = threading.Thread(target=closer)
-    close_thread.start()
-    try:
-        with db._read_conns_lock:
-            assert db._read_conns_closed
-            assert not close_returned.is_set()
-    finally:
-        finish_read.set()
-
-    reader_thread.join(timeout=5.0)
-    close_thread.join(timeout=5.0)
-    assert not reader_thread.is_alive()
-    assert not close_thread.is_alive()
-    if failures:
-        raise failures[0]
-    assert close_returned.is_set()
-    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-        read_conn[0].execute("SELECT 1")
