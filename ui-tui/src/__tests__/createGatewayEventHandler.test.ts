@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
@@ -57,6 +57,10 @@ const buildCtx = (appended: Msg[]) =>
       setVoiceEnabled: vi.fn()
     }
   }) as any
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 describe('createGatewayEventHandler', () => {
   beforeEach(() => {
@@ -789,6 +793,8 @@ describe('createGatewayEventHandler', () => {
     }
 
     // Dark terminal (clean env): the dark-authored `colors` block wins.
+    vi.stubEnv('HERMES_TUI_LIGHT', '')
+    vi.stubEnv('HERMES_TUI_THEME', '')
     vi.stubEnv('HERMES_TUI_BACKGROUND', '')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#00FF88')
@@ -797,7 +803,6 @@ describe('createGatewayEventHandler', () => {
     vi.stubEnv('HERMES_TUI_BACKGROUND', '#ffffff')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#8B0000')
-    vi.unstubAllEnvs()
   })
 
   it('a skin that owns the background paints BOTH terminal defaults (OSC 11 bg + OSC 10 fg)', () => {
