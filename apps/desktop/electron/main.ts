@@ -35,7 +35,7 @@ import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } f
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
-import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import { isReauthRequiredError, makeNousCloudBackendDownError, waitForHermesReady } from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
   canImportHermesCli,
@@ -232,6 +232,7 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
+  dispatchConnectionScopedProfileDelete,
   localProfilePoolKeys,
   ProfileDeletionGate,
   profileNameFromDeleteRequest,
@@ -353,7 +354,7 @@ import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
-import { resolvePickerDefaultPath } from './wsl-path-bridge'
+import { resolvePickerDefaultPath, setActiveGatewayProfile, setWslBridgeProfileState } from './wsl-path-bridge'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
 
@@ -1371,11 +1372,13 @@ let nativeThemeListenerInstalled = false
 let bootProgressState = {
   error: null,
   fakeMode: BOOT_FAKE_MODE,
+  isCloudBackendDown: false,
   message: 'Waiting to start Hermes backend',
   phase: 'idle',
   progress: 0,
   retryable: false,
   running: false,
+  statusCode: null,
   timestamp: Date.now()
 }
 
@@ -8979,6 +8982,19 @@ async function buildRemoteConnection(
     try {
       ticket = await mintGatewayWsTicket(baseUrl, remoteHeaders)
     } catch (error) {
+      // For a Nous-managed Cloud agent, a 502/503/504 from the WS-ticket mint
+      // means the backend server itself is down — the actionable Cloud-down
+      // error. This boundary runs BEFORE the readiness loop, so without this
+      // the ticket wrapper below would swallow the server-fault classification
+      // and the renderer would never see isCloudBackendDown. Preserve the
+      // existing 401/403 reauth and generic transport behavior for everything
+      // else (#85335).
+      const cloudError = makeNousCloudBackendDownError(baseUrl, error)
+
+      if (cloudError !== null) {
+        throw cloudError
+      }
+
       throw gatewayTicketFailure(
         error,
         'Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.',
@@ -9898,6 +9914,7 @@ async function ensureBackend(profile) {
 
   if (route.backend === 'primary') {
     const connection = await startHermes()
+    setWslBridgeProfileState(key, connection.mode !== 'remote')
 
     // A shared backend still owes the caller its profile scope, so renderer-side
     // WebSocket, filesystem, and cache routing target the selected profile.
@@ -9921,8 +9938,10 @@ async function ensureBackend(profile) {
 
   if (existing) {
     existing.lastActiveAt = Date.now()
+    const connection = await existing.connectionPromise
+    setWslBridgeProfileState(key, connection.mode !== 'remote')
 
-    return existing.connectionPromise
+    return connection
   }
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
@@ -9955,7 +9974,10 @@ async function ensureBackend(profile) {
   backendPool.set(key, entry)
   startPoolIdleReaper()
 
-  return entry.connectionPromise
+  const connection = await entry.connectionPromise
+  setWslBridgeProfileState(key, connection.mode !== 'remote')
+
+  return connection
 }
 
 // ── Registry-scoped backends (multi-connection, PR 2 of the campaign) ──────
@@ -10579,6 +10601,11 @@ async function startHermes() {
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
+  const primaryProfile = primaryProfileKey()
+
+  // Legacy path callers without an explicit profile belong to the primary
+  // window backend. Profile-scoped callers still pass their key directly.
+  setActiveGatewayProfile(primaryProfile)
 
   // Classify this boot BEFORE the throwing resolve/mint runs: a remote failure
   // must NOT latch (it's transient — see shouldLatchBackendStartFailure), while
@@ -10660,7 +10687,7 @@ async function startHermes() {
         // both for an already-saved remote and after first-run remote Apply.
         attemptedRemote = primaryBackendIsRemote()
 
-        return resolveRemoteBackend(primaryProfileKey())
+        return resolveRemoteBackend(primaryProfile)
       },
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
@@ -10669,8 +10696,17 @@ async function startHermes() {
     })
 
     if (setup.kind === 'remote') {
+      // Paths from the remote backend belong to a host the Windows desktop
+      // cannot open via wsl.exe — disable WSL path bridging so native dialogs
+      // and file panels don't spawn wsl.exe (or the interactive install prompt
+      // on WSL-less machines) for unresolvable paths. (#66433)
+      setWslBridgeProfileState(primaryProfile, false)
+
       return setup.connection
     }
+
+    // Local WSL backend — paths are bridgeable.
+    setWslBridgeProfileState(primaryProfile, true)
 
     const backend = setup.backend
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
@@ -10872,6 +10908,18 @@ async function startHermes() {
     const message = error instanceof Error ? error.message : String(error)
     const hostKeyChanged = isHostKeyChangedBootFailure(error)
 
+    // Carry structured Cloud-down metadata through the boot-progress / IPC
+    // boundary when present, so the renderer overlay can key on it rather than
+    // re-classifying the message string. main owns classification; the renderer
+    // only consumes the structured result (#85335).
+    const isCloudBackendDown = Boolean(error && typeof error === 'object' && (error as any).isCloudBackendDown === true)
+
+    const statusCode = Number(
+      error && typeof error === 'object' && Number.isInteger((error as any).statusCode)
+        ? (error as any).statusCode
+        : NaN
+    )
+
     // Only latch LOCAL boot failures. A remote failure (lapsed session / mint
     // timeout / host briefly unreachable across sleep) is transient and has no
     // child 'exit' handler to clear the cache — latching it would wedge the app
@@ -10900,6 +10948,7 @@ async function startHermes() {
     updateBootProgress(
       {
         error: message,
+        isCloudBackendDown: isCloudBackendDown || undefined,
         message: `Desktop boot failed: ${message}`,
         phase: 'backend.error',
         // Renderer contract for the self-heal loop (#82679): a transient
@@ -10913,7 +10962,8 @@ async function startHermes() {
           isReauth: isReauthRequiredError(error),
           isHostKeyChanged: hostKeyChanged
         }),
-        running: false
+        running: false,
+        statusCode: Number.isInteger(statusCode) ? statusCode : undefined
       },
       { allowDecrease: true }
     )
@@ -13597,6 +13647,45 @@ async function pooledRegistrySessionSources(): Promise<RegistrySessionSource[]> 
   return sources
 }
 
+async function dispatchRegistryApiRequest(
+  request,
+  registryConnectionId,
+  routeProfile = request?.profile,
+  requestProfile = request?.profile
+) {
+  const connection: any = await ensureRegistryBackend(registryConnectionId, routeProfile)
+
+  const requestPath = connection.sharedRemote
+    ? pathWithProfileScope(request.path, requestProfile)
+    : translateSelfProfileQuery(request.path, requestProfile, connection.remoteProfile)
+
+  return fetchJsonForBackend(connection, requestPath, {
+    method: request?.method,
+    body: request?.body,
+    upload: request?.upload,
+    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  })
+}
+
+function registryConnectionKind(connectionId) {
+  const registry = readDesktopConnectionsRegistry()
+  const source = registry.connections.find(connection => connection.id === connectionId)
+
+  if (!source) {
+    throw new Error(`No connection with id "${connectionId}".`)
+  }
+
+  return source.kind
+}
+
+async function teardownConnectionScopedProfileBackend(connectionId, profile) {
+  const key = backendScopeKey(connectionId, profile)
+  await Promise.all([
+    poolStopper.stop(key),
+    sshBootstrapCoordinator.cancelAndWait(key).then(() => teardownSshConnection(key))
+  ])
+}
+
 async function handleHermesApiRequest(request) {
   // Registry-pinned request (request.connectionId): the renderer is working
   // against a REGISTERED gateway connection, so the data — cron jobs and their
@@ -13609,22 +13698,7 @@ async function handleHermesApiRequest(request) {
   const registryConnectionId = apiRequestRegistryConnectionId(request)
 
   if (registryConnectionId) {
-    const connection: any = await ensureRegistryBackend(registryConnectionId, request?.profile)
-
-    // A shared remote host serves every profile via ?profile=; an SSH-scoped
-    // backend instead runs AS one remote profile, so an explicit self-profile
-    // filter must be translated from the desktop routing label into that
-    // backend namespace (same contract as the v1 profileRouteOptions path).
-    const requestPath = connection.sharedRemote
-      ? pathWithProfileScope(request.path, request?.profile)
-      : translateSelfProfileQuery(request.path, request?.profile, connection.remoteProfile)
-
-    return fetchJsonForBackend(connection, requestPath, {
-      method: request?.method,
-      body: request?.body,
-      upload: request?.upload,
-      timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-    })
+    return dispatchRegistryApiRequest(request, registryConnectionId)
   }
 
   // Remote-profile session requests would otherwise hit the local primary off
@@ -13735,6 +13809,21 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // respawn the old-name backend and recreate its HERMES_HOME (#45474).
   const deletingProfile = profileNameFromDeleteRequest(request)
   const mutatingProfile = deletingProfile || profileRenameFromRequest(request)?.oldName || null
+  const registryConnectionId = apiRequestRegistryConnectionId(request)
+
+  if (deletingProfile && registryConnectionId) {
+    return dispatchConnectionScopedProfileDelete(request, {
+      acquire: profile => profileDeletionGate.acquire(profile),
+      connectionKind: connectionId => registryConnectionKind(connectionId),
+      dispatch: routeProfile =>
+        dispatchRegistryApiRequest(request, registryConnectionId, routeProfile, deletingProfile),
+      isDefaultProfile: profile => profile === 'default',
+      isValidProfileName: profile => PROFILE_NAME_RE.test(profile),
+      prepareLocal: localRequest => prepareProfileDeleteRequest(localRequest).then(() => undefined),
+      teardownConnection: (connectionId, profile) =>
+        teardownConnectionScopedProfileBackend(connectionId, profile)
+    })
+  }
 
   if (!mutatingProfile) {
     return handleHermesApiRequest(request)
@@ -13940,7 +14029,10 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
     try {
       // On a Windows host with a WSL backend the cwd may be a POSIX/WSL path;
       // bridge it to a UNC/drive form the native dialog can actually open.
-      const bridged = IS_WINDOWS ? resolvePickerDefaultPath(String(options.defaultPath)) : String(options.defaultPath)
+      const bridged = IS_WINDOWS
+        ? resolvePickerDefaultPath(String(options.defaultPath), undefined, options?.profile)
+        : String(options.defaultPath)
+
       resolvedDefaultPath = bridged ? path.resolve(bridged) : undefined
     } catch {
       resolvedDefaultPath = undefined
@@ -15030,6 +15122,12 @@ app.whenReady().then(() => {
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
   f12Blocked = readPersistedDisableF12()
+  // Seed this before the first window exists: a picker can open before
+  // startHermes() finishes resolving the configured backend.
+  const primaryProfile = primaryProfileKey()
+
+  setActiveGatewayProfile(primaryProfile)
+  setWslBridgeProfileState(primaryProfile, !primaryBackendIsRemote())
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).

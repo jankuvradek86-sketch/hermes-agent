@@ -204,7 +204,7 @@ test('shape: revealed hidden rows are dimmed and flagged with the eye-closed gly
   assert.match(botRow, /meta\?\.hidden && 'opacity-60'/)
   assert.match(botRow, /name: 'eye-closed'/)
   assert.match(botRow, /children: meta\?\.hidden \? 'Unhide Bot' : 'Hide Bot'/)
-  assert.match(botRow, /saveBotMeta\(bot\.name, \{ hidden: !hidden \}\)/)
+  assert.match(botRow, /saveBotMeta\(bot, \{ hidden: !hidden \}\)/)
 })
 
 test('shape: hiding never filters mentions, group flows, or the meta/activity sweeps', () => {
@@ -217,7 +217,7 @@ test('shape: hiding never filters mentions, group flows, or the meta/activity sw
   // Mention resolution never consults the hidden flag.
   const mentions = pluginSource.slice(
     pluginSource.indexOf('function resolveRosterMentions('),
-    pluginSource.indexOf('const REMOTE_DM_TIMEOUT_MS')
+    pluginSource.indexOf('/** Source-qualified identity for a roster row')
   )
   assert.doesNotMatch(mentions, /hidden/i)
 })

@@ -252,6 +252,76 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """A fork sync that pulls code must continue through post-update work."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+
+        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb:
+        # the sync moved HEAD). The NEXT two bracket the pull inside the
+        # normal update path (bbbbbbb -> ccccccc) — the head-moved no-op
+        # guard added after this PR exits 1 when that pair is equal, so the
+        # mock must show the pull advancing HEAD too.
+        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
+
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            update_cmd,
+            "_capture_head_sha",
+            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
+        ), patch(
+            # The full post-update path runs the fleet version check, which
+            # reads the REAL machine's profile gateway_state.json files —
+            # live gateways on a dev box read as STALE vs this checkout and
+            # exit 1. Pin an empty fleet: this test asserts the post-update
+            # path RUNS, not the fleet's health.
+            "hermes_cli.update_receipt.collect_fleet_versions",
+            return_value=[],
+        ), patch(
+            # Same isolation for the restart phase: without these, the real
+            # machine's live gateways enter the restart discovery, the
+            # mocked-subprocess restart phase can't verify replacements, and
+            # the fail-closed contract (#78574) exits 1 (locally the
+            # live-system guard blocks the os.kill outright).
+            "hermes_cli.gateway.find_gateway_pids",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway.find_profile_gateway_processes",
+            return_value=[],
+        ), patch(
+            "hermes_cli.gateway._get_service_pids",
+            return_value=set(),
+        ), patch.object(
+            hm, "_sync_with_upstream_if_needed"
+        ), patch.object(
+            hm,
+            "_reload_updated_runtime_modules",
+            # Reaching the reload step IS the proof the post-update path ran
+            # (the bug returned from "Already up to date!" before it). Abort
+            # the pipeline right here: everything past this point (skills
+            # sync, desktop rebuild, gateway restart, fleet check) would run
+            # for real against the host machine.
+            side_effect=SystemExit(0),
+        ) as post_update_step:
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(mock_args)
+
+        assert exit_info.value.code == 0
+        post_update_step.assert_called_once_with()
+        captured = capsys.readouterr()
+        assert "Already up to date!" not in captured.out
+
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
         with patch("shutil.which", return_value=None), patch(
@@ -885,7 +955,15 @@ class TestNodeRuntimeNpmResolution:
         )
 
     def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
-        """The Windows ZIP fallback restores Desktop after replacing ``apps/``."""
+        """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
+
+        Contract updated for the #70337/#87331 release-dir graft: the built
+        desktop app (release/win-unpacked/Hermes.exe) is preserved THROUGH
+        the swap — previously this test pinned the old repair shape (exe
+        deleted by the swap, then rebuilt from scratch). The rebuild hook
+        still runs (mocked _desktop_build_needed=True), but it now finds
+        the packaged exe alive rather than missing.
+        """
         import zipfile
 
         from hermes_cli import main as hm
@@ -971,7 +1049,12 @@ class TestNodeRuntimeNpmResolution:
                 gateway_mode=False,
             )
 
-        assert desktop_builds == [True]
+        # Release-dir graft (#70337): the packaged exe SURVIVES the swap, so
+        # the rebuild hook observed it present (False), and the bytes are the
+        # original build — never deleted, never rebuilt from nothing.
+        assert desktop_builds == [False]
+        assert packaged_exe.exists()
+        assert packaged_exe.read_bytes() == b"desktop"
 
 
 class TestUpdateNodeDependencies:
