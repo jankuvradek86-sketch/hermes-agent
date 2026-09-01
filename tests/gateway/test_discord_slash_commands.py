@@ -506,6 +506,55 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
     )
 
 
+def test_build_slash_event_preserves_profile_route_coordinates(adapter):
+    """Slash events must carry the same route coordinates as normal messages."""
+    channel = _FakeTextChannel(channel_id=123, guild_name="TestGuild")
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=123,
+        guild_id=456,
+        user=SimpleNamespace(id=42, display_name="Jezza"),
+    )
+
+    def resolve_profile(source):
+        assert source.guild_id == "456"
+        assert source.chat_id == "123"
+        assert source.parent_chat_id is None
+        return "jaros-app"
+
+    adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=resolve_profile)
+    event = adapter._build_slash_event(interaction, "/reset")
+
+    assert event.source.guild_id == "456"
+    assert event.source.parent_chat_id is None
+    assert event.source.profile == "jaros-app"
+
+
+def test_build_thread_slash_event_preserves_parent_route_coordinate(adapter):
+    """Thread slash events must retain the parent channel used by profile routes."""
+    channel = _FakeThreadChannel(channel_id=200, parent_id=100)
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=200,
+        guild_id=456,
+        user=SimpleNamespace(id=42, display_name="Jezza"),
+    )
+
+    def resolve_profile(source):
+        assert source.guild_id == "456"
+        assert source.thread_id == "200"
+        assert source.parent_chat_id == "100"
+        return "jaros-app"
+
+    adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=resolve_profile)
+    event = adapter._build_slash_event(interaction, "/reset")
+
+    assert event.source.guild_id == "456"
+    assert event.source.thread_id == "200"
+    assert event.source.parent_chat_id == "100"
+    assert event.source.profile == "jaros-app"
+
+
 # ------------------------------------------------------------------
 # Config bridge
 # ------------------------------------------------------------------

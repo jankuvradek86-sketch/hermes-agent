@@ -6422,6 +6422,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        # Profile routing needs the same guild/parent coordinates that regular
+        # Discord messages carry.  Without them, channel/thread routes cannot
+        # match and slash commands fall back to the default session namespace.
+        guild_id = getattr(interaction, "guild_id", None)
+        if guild_id is None:
+            guild_id = getattr(getattr(interaction.channel, "guild", None), "id", None)
+        parent_chat_id = self._get_parent_channel_id(interaction.channel) if is_thread else None
+
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -6430,17 +6438,18 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(guild_id) if guild_id is not None else None,
+            parent_chat_id=parent_chat_id,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
             source=source,
             raw_message=interaction,
-            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            channel_prompt=self._resolve_channel_prompt(channel_id, parent_chat_id),
         )
 
     # ------------------------------------------------------------------
