@@ -1,15 +1,18 @@
 """Gateway /loop command tests — dispatch, routing capture, mid-run guard."""
 
+import asyncio
 import logging
 import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from gateway import run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_constants import get_hermes_home
 from hermes_cli import goals, loops
 
 
@@ -232,6 +235,112 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False
     assert "goal continuation hook failed: judge failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secondary_live", [True, False], ids=["live", "missing"])
+async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
+    loop_env, monkeypatch, secondary_live
+):
+    import hermes_state
+
+    # The suite-wide isolation fixture pins every SessionDB to one temp path.
+    # Restore dynamic HERMES_HOME resolution for this profile-scope regression.
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "coder"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    session_id = "secondary-loop"
+
+    # Persist the only active loop in the secondary profile's existing store.
+    with gateway_run._profile_runtime_scope(profile_home):
+        await asyncio.to_thread(goals._get_session_db)
+        manager = loops.LoopManager(session_id=session_id)
+        state = manager.set(
+            "check the secondary deploy",
+            interval_seconds=300,
+            route={
+                "platform": "discord",
+                "chat_id": "secondary-channel",
+                "chat_type": "channel",
+                "user_id": "secondary-user",
+            },
+        )
+        state.next_due_at = time.time() - 1
+        loops.save_loop(session_id, state)
+
+    assert get_hermes_home() == loop_env
+    await asyncio.to_thread(goals._get_session_db)
+    assert loops.load_loop(session_id) is None
+
+    default_adapter = Mock()
+    default_adapter.handle_message = AsyncMock()
+    secondary_adapter = Mock()
+    secondary_adapter.handle_message = AsyncMock()
+
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[profile_name],
+    )
+    runner.session_store = None
+    runner.adapters = {Platform.DISCORD: default_adapter}
+    runner._profile_adapters = (
+        {profile_name: {Platform.DISCORD: secondary_adapter}}
+        if secondary_live
+        else {}
+    )
+    runner._running_agents = {}
+    runner._running = True
+
+    warmed_homes = []
+
+    async def _record_warm(_label):
+        warmed_homes.append(get_hermes_home())
+
+    runner._warm_goals_session_db = _record_warm
+
+    sleep_calls = 0
+
+    async def _finish_after_one_scan(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+    await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+    default_adapter.handle_message.assert_not_awaited()
+    assert warmed_homes == [loop_env, profile_home]
+    if not secondary_live:
+        secondary_adapter.handle_message.assert_not_awaited()
+        with gateway_run._profile_runtime_scope(profile_home):
+            secondary_state = loops.load_loop(session_id)
+            assert secondary_state is not None
+            assert secondary_state.awaiting_response is False
+            assert secondary_state.ticks_fired == 0
+        assert loops.load_loop(session_id) is None
+        return
+
+    secondary_adapter.handle_message.assert_awaited_once()
+    event = secondary_adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source.profile == profile_name
+    assert event.source.thread_id is None
+    assert runner._session_key_for_source(event.source).startswith(
+        f"agent:{profile_name}:discord:channel:secondary-channel"
+    )
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        secondary_state = loops.load_loop(session_id)
+        assert secondary_state is not None
+        assert secondary_state.awaiting_response is True
+        assert secondary_state.ticks_fired == 1
+    assert loops.load_loop(session_id) is None
 
 
 @pytest.mark.asyncio

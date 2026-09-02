@@ -22873,6 +22873,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
+
+        async def _tick(profile_name: Optional[str] = None) -> None:
+            """Scan the loop store and adapters for the active profile scope."""
+            if profile_name is None:
+                adapters = self.adapters
+            else:
+                adapters = (
+                    (getattr(self, "_profile_adapters", None) or {}).get(profile_name)
+                    or {}
+                )
+
+            # Warm the cache off-loop once per profile scan. The surrounding
+            # runtime scope keeps both the warm-up and all reads/writes below
+            # on that profile's state.db.
+            await self._warm_goals_session_db("loop wakeup")
+
+            now = time.time()
+            for sid, state in list_active_loops():
+                if state.awaiting_response or now < state.next_due_at:
+                    continue
+                route = state.route or {}
+                platform_name = route.get("platform", "")
+                chat_id = route.get("chat_id", "")
+                if not platform_name or not chat_id:
+                    # CLI / TUI-owned loop — their own schedulers drive it.
+                    continue
+                adapter = None
+                for p, a in adapters.items():
+                    if p.value == platform_name:
+                        adapter = a
+                        break
+                if adapter is None:
+                    if sid not in warned_no_route:
+                        warned_no_route.add(sid)
+                        logger.debug(
+                            "loop wakeup: no adapter for platform %r (session %s)",
+                            platform_name, sid,
+                        )
+                    continue
+
+                # Build the source + session key to check business.
+                evt_stub = {
+                    "session_key": "",
+                    "platform": platform_name,
+                    "chat_id": chat_id,
+                    "chat_type": route.get("chat_type", ""),
+                    "thread_id": route.get("thread_id", ""),
+                    "user_id": route.get("user_id", ""),
+                    "user_name": route.get("user_name", ""),
+                    "profile": profile_name,
+                }
+                source = self._build_process_event_source(evt_stub)
+                if source is None:
+                    continue
+                try:
+                    session_key = self._session_key_for_source(source)
+                except Exception:
+                    session_key = None
+                if session_key and session_key in self._running_agents:
+                    continue  # busy — stays due, next scan retries
+                if goal_blocks_loop_tick(sid):
+                    continue
+
+                mgr = LoopManager(session_id=sid)
+                if not mgr.is_due(now):
+                    continue
+                wakeup = mgr.fire_tick()
+                if not wakeup:
+                    continue
+                try:
+                    synth_event = MessageEvent(
+                        text=wakeup,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        internal=True,
+                    )
+                    logger.info(
+                        "loop wakeup #%s — injecting for %s chat=%s thread=%s",
+                        mgr.state.ticks_fired if mgr.state else "?",
+                        platform_name, source.chat_id, source.thread_id,
+                    )
+                    await adapter.handle_message(synth_event)
+                    # Slash-command loops dispatch through the command
+                    # path and never hit the post-turn completion hook —
+                    # complete the tick immediately (caps + scheduling).
+                    if wakeup.lstrip().startswith("/"):
+                        mgr.complete_tick("")
+                except Exception as exc:
+                    logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
+                    try:
+                        mgr.abandon_tick()
+                    except Exception:
+                        pass
+
         while self._running:
             try:
                 from hermes_cli.loops import (
@@ -22881,87 +22975,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     list_active_loops,
                 )
 
-                # Warm the cache off-loop once per scan. The scan reads
-                # every persisted loop, so a cold cache runs the state.db
-                # init on the loop thread before the first read.
-                await self._warm_goals_session_db("loop wakeup")
-
-                now = time.time()
-                for sid, state in list_active_loops():
-                    if state.awaiting_response or now < state.next_due_at:
-                        continue
-                    route = state.route or {}
-                    platform_name = route.get("platform", "")
-                    chat_id = route.get("chat_id", "")
-                    if not platform_name or not chat_id:
-                        # CLI / TUI-owned loop — their own schedulers drive it.
-                        continue
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p.value == platform_name:
-                            adapter = a
-                            break
-                    if adapter is None:
-                        if sid not in warned_no_route:
-                            warned_no_route.add(sid)
-                            logger.debug(
-                                "loop wakeup: no adapter for platform %r (session %s)",
-                                platform_name, sid,
-                            )
-                        continue
-
-                    # Build the source + session key to check business.
-                    evt_stub = {
-                        "session_key": "",
-                        "platform": platform_name,
-                        "chat_id": chat_id,
-                        "chat_type": route.get("chat_type", ""),
-                        "thread_id": route.get("thread_id", ""),
-                        "user_id": route.get("user_id", ""),
-                        "user_name": route.get("user_name", ""),
-                    }
-                    source = self._build_process_event_source(evt_stub)
-                    if source is None:
-                        continue
-                    try:
-                        session_key = self._session_key_for_source(source)
-                    except Exception:
-                        session_key = None
-                    if session_key and session_key in self._running_agents:
-                        continue  # busy — stays due, next scan retries
-                    if goal_blocks_loop_tick(sid):
-                        continue
-
-                    mgr = LoopManager(session_id=sid)
-                    if not mgr.is_due(now):
-                        continue
-                    wakeup = mgr.fire_tick()
-                    if not wakeup:
-                        continue
-                    try:
-                        synth_event = MessageEvent(
-                            text=wakeup,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            internal=True,
-                        )
-                        logger.info(
-                            "loop wakeup #%s — injecting for %s chat=%s thread=%s",
-                            mgr.state.ticks_fired if mgr.state else "?",
-                            platform_name, source.chat_id, source.thread_id,
-                        )
-                        await adapter.handle_message(synth_event)
-                        # Slash-command loops dispatch through the command
-                        # path and never hit the post-turn completion hook —
-                        # complete the tick immediately (caps + scheduling).
-                        if wakeup.lstrip().startswith("/"):
-                            mgr.complete_tick("")
-                    except Exception as exc:
-                        logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-                        try:
-                            mgr.abandon_tick()
-                        except Exception:
-                            pass
+                for profile_name, profile_home in _handoff_watch_scopes(self):
+                    if profile_home is None:
+                        await _tick(profile_name)
+                    else:
+                        with _profile_runtime_scope(profile_home):
+                            await _tick(profile_name)
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
@@ -26203,6 +26222,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
             scope_id=scope_id,
+            profile=str(evt.get("profile") or "").strip() or None,
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
