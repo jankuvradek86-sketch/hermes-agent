@@ -3197,6 +3197,12 @@ class GatewaySlashCommandsMixin:
                     "thread_id": str(getattr(src, "thread_id", "") or ""),
                     "user_id": str(getattr(src, "user_id", "") or ""),
                     "user_name": str(getattr(src, "user_name", "") or ""),
+                    "scope_id": str(getattr(src, "scope_id", "") or ""),
+                    "guild_id": str(getattr(src, "guild_id", "") or ""),
+                    "parent_chat_id": str(
+                        getattr(src, "parent_chat_id", "") or ""
+                    ),
+                    "profile": str(getattr(src, "profile", "") or ""),
                 }
                 route = {k: v for k, v in route.items() if v}
         except Exception:

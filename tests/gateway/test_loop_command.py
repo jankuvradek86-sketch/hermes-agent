@@ -10,8 +10,9 @@ import pytest
 from gateway import run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
 from hermes_constants import get_hermes_home
 from hermes_cli import goals, loops
 
@@ -70,7 +71,13 @@ def _make_event(text: str) -> MessageEvent:
 @pytest.mark.asyncio
 async def test_gateway_loop_create_captures_route(loop_env):
     runner = _make_runner()
-    response = await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m check the deploy"))
+    event = _make_event("/loop 5m check the deploy")
+    event.source.scope_id = "guild-7"
+    event.source.guild_id = "guild-7"
+    event.source.parent_chat_id = "parent-channel"
+    event.source.profile = "coder"
+
+    response = await GatewayRunner._handle_loop_command(runner, event)
     assert "Loop set" in response
     assert "every 5m" in response
 
@@ -80,6 +87,10 @@ async def test_gateway_loop_create_captures_route(loop_env):
     assert state.route["platform"] == "discord"
     assert state.route["chat_id"] == "chat-loop"
     assert state.route["thread_id"] == "thread-9"
+    assert state.route["scope_id"] == "guild-7"
+    assert state.route["guild_id"] == "guild-7"
+    assert state.route["parent_chat_id"] == "parent-channel"
+    assert state.route["profile"] == "coder"
 
 
 @pytest.mark.asyncio
@@ -341,6 +352,105 @@ async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
         assert secondary_state.awaiting_response is True
         assert secondary_state.ticks_fired == 1
     assert loops.load_loop(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_watcher_uses_shared_adapter_for_matching_profile_route(
+    loop_env, monkeypatch
+):
+    import hermes_state
+
+    # Match the restart topology: the loop route predates richer scope capture,
+    # while the durable session origin still has the complete routed identity.
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "coder"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    sessions_dir = loop_env / "gateway-sessions"
+    config = GatewayConfig(
+        sessions_dir=sessions_dir,
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[profile_name],
+        profile_routes=[
+            ProfileRoute(
+                name="coder-discord",
+                platform="discord",
+                profile=profile_name,
+                guild_id="guild-7",
+                chat_id="secondary-channel",
+            )
+        ],
+    )
+    persisted_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="secondary-channel",
+        chat_type="group",
+        thread_id=None,
+        user_id="secondary-user",
+        scope_id="guild-7",
+        parent_chat_id=None,
+        profile=profile_name,
+    )
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        await asyncio.to_thread(goals._get_session_db)
+        pre_restart_store = SessionStore(sessions_dir, config)
+        session_entry = pre_restart_store.get_or_create_session(persisted_source)
+        session_key = session_entry.session_key
+        manager = loops.LoopManager(session_id=session_entry.session_id)
+        state = manager.set(
+            "check the routed deploy",
+            interval_seconds=300,
+            route={
+                "platform": "discord",
+                "chat_id": "secondary-channel",
+                "chat_type": "group",
+                "user_id": "secondary-user",
+            },
+        )
+        state.next_due_at = time.time() - 1
+        loops.save_loop(session_entry.session_id, state)
+        pre_restart_store.close_all_db_handles()
+
+    shared_adapter = Mock()
+    shared_adapter.handle_message = AsyncMock()
+
+    runner = _make_runner()
+    runner.config = config
+    runner.session_store = SessionStore(sessions_dir, config)
+    runner.adapters = {Platform.DISCORD: shared_adapter}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._running = True
+    runner._warm_goals_session_db = AsyncMock()
+
+    sleep_calls = 0
+
+    async def _finish_after_one_scan(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+    try:
+        await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+    finally:
+        runner.session_store.close_all_db_handles()
+
+    shared_adapter.handle_message.assert_awaited_once()
+    event = shared_adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source.profile == profile_name
+    assert event.source.scope_id == "guild-7"
+    assert event.source.guild_id == "guild-7"
+    assert event.source.thread_id is None
+    assert runner._session_key_for_source(event.source) == session_key
+    assert event.source._transport_adapter_ref() is shared_adapter
+    assert runner._adapter_for_source(event.source) is shared_adapter
 
 
 @pytest.mark.asyncio
