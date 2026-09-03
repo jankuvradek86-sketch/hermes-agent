@@ -333,6 +333,7 @@ async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
                 "chat_id": "secondary-channel",
                 "chat_type": "channel",
                 "user_id": "secondary-user",
+                "profile": profile_name,
             },
         )
         state.next_due_at = time.time() - 1
@@ -408,6 +409,143 @@ async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
         assert secondary_state.awaiting_response is True
         assert secondary_state.ticks_fired == 1
     assert loops.load_loop(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_watcher_ignores_foreign_profile_row_in_launch_db(
+    loop_env, monkeypatch
+):
+    """A copied legacy row without local ownership proof must fail closed."""
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "coder"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    session_id = "foreign-profile-loop"
+
+    await asyncio.to_thread(goals._get_session_db)
+    manager = loops.LoopManager(session_id=session_id)
+    state = manager.set(
+        "must stay in coder",
+        interval_seconds=300,
+        route={
+            "platform": "discord",
+            "chat_id": "coder-channel",
+            "chat_type": "channel",
+            "user_id": "coder-user",
+        },
+    )
+    state.ticks_fired = 1
+    state.awaiting_response = True
+    state.next_due_at = time.time() - 1
+    loops.save_loop(session_id, state)
+
+    shared_adapter = Mock()
+    shared_adapter.handle_message = AsyncMock()
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[profile_name],
+    )
+    runner.session_store = None
+    runner.adapters = {Platform.DISCORD: shared_adapter}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._running = True
+    runner._warm_goals_session_db = AsyncMock()
+
+    sleep_calls = 0
+
+    async def _finish_after_one_scan(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+    await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+    shared_adapter.handle_message.assert_not_awaited()
+    reloaded = loops.load_loop(session_id)
+    assert reloaded is not None
+    assert reloaded.awaiting_response is True
+    assert reloaded.ticks_fired == 1
+    with gateway_run._profile_runtime_scope(profile_home):
+        await asyncio.to_thread(goals._get_session_db)
+        assert loops.load_loop(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_watcher_uses_named_launch_profile_as_scan_owner(
+    loop_env, monkeypatch
+):
+    """The unscoped launch scan may itself belong to a named profile."""
+    import hermes_state
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "launch-profile"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    session_id = "session-launch-profile-loop"
+    token = set_hermes_home_override(profile_home)
+    try:
+        await asyncio.to_thread(goals._get_session_db)
+        manager = loops.LoopManager(session_id)
+        state = manager.set(
+            "continue launch work",
+            interval_seconds=60,
+            route={
+                "platform": "discord",
+                "chat_id": "launch-channel",
+                "chat_type": "channel",
+                "user_id": "launch-user",
+                "profile": profile_name,
+            },
+        )
+        state.next_due_at = time.time() - 1
+        loops.save_loop(session_id, state)
+
+        shared_adapter = Mock()
+        shared_adapter.handle_message = AsyncMock()
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+        )
+        runner.session_store = None
+        runner.adapters = {Platform.DISCORD: shared_adapter}
+        runner._profile_adapters = {}
+        runner._running_agents = {}
+        runner._running = True
+        runner._warm_goals_session_db = AsyncMock()
+
+        sleep_calls = 0
+
+        async def _finish_after_one_scan(_delay):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                runner._running = False
+
+        monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+        await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+        shared_adapter.handle_message.assert_awaited_once()
+        event = shared_adapter.handle_message.await_args.args[0]
+        assert event.source.profile == profile_name
+    finally:
+        reset_hermes_home_override(token)
 
 
 @pytest.mark.asyncio
@@ -603,6 +741,7 @@ async def test_loop_wakeup_watcher_reclaims_due_idle_awaiting_tick(
         assert recovered.awaiting_response is True
         assert recovered.ticks_fired == 2
         assert recovered.last_fired_at > state.last_fired_at
+    assert loops.load_loop(session_entry.session_id) is None
 
 
 @pytest.mark.asyncio

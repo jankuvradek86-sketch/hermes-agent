@@ -24744,6 +24744,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
+        warned_foreign_scope: set[tuple[str, str, str]] = set()
 
         async def _tick(profile_name: Optional[str] = None) -> None:
             """Scan the loop store and adapters for the active profile scope."""
@@ -24765,6 +24766,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if now < state.next_due_at:
                     continue
                 route = state.route or {}
+                route_profile = str(route.get("profile") or "").strip()
+                if profile_name is None:
+                    from hermes_cli.profiles import get_active_profile_name
+
+                    scan_profile = get_active_profile_name() or "default"
+                else:
+                    scan_profile = profile_name
+                row_profile = route_profile
+                if not row_profile and self.config.multiplex_profiles:
+                    # Older loop rows predate route.profile. Resolve their
+                    # owner from the session row in THIS store; a copied loop
+                    # has no matching local session (or names another profile)
+                    # and must fail closed rather than becoming default work.
+                    def _session_owner_profile() -> str:
+                        session_db = _get_session_db()
+                        if session_db is None:
+                            return ""
+                        session = session_db.get_session(sid)
+                        return str((session or {}).get("profile_name") or "").strip()
+
+                    row_profile = await self._run_in_executor_with_context(
+                        _session_owner_profile
+                    )
+                if self.config.multiplex_profiles and row_profile != scan_profile:
+                    # A routed loop row in another profile's DB is foreign
+                    # residue, not work for this scan. Never reclaim, fire, or
+                    # mutate it here: the owning profile scan is the only
+                    # authority for that loop. Unowned legacy rows also fail
+                    # closed because multiplex routing cannot prove ownership.
+                    warning_key = (sid, row_profile or "unowned", scan_profile)
+                    if warning_key not in warned_foreign_scope:
+                        warned_foreign_scope.add(warning_key)
+                        logger.warning(
+                            "loop wakeup: ignoring foreign or unowned profile row "
+                            "for session %s (row profile=%s, store profile=%s)",
+                            sid,
+                            row_profile or "unowned",
+                            scan_profile,
+                        )
+                    continue
                 platform_name = route.get("platform", "")
                 chat_id = route.get("chat_id", "")
                 if not platform_name or not chat_id:
@@ -24783,7 +24824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "scope_id": route.get("scope_id", ""),
                     "guild_id": route.get("guild_id", ""),
                     "parent_chat_id": route.get("parent_chat_id", ""),
-                    "profile": profile_name,
+                    "profile": None if scan_profile == "default" else scan_profile,
                 }
                 source = self._build_process_event_source(evt_stub)
                 if source is None:
@@ -24925,6 +24966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
+                from hermes_cli.goals import _get_session_db
                 from hermes_cli.loops import (
                     LoopManager,
                     goal_blocks_loop_tick,
