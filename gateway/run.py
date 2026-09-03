@@ -22761,6 +22761,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is_internal: bool,
         event: Any = None,
     ) -> None:
+        """Run post-turn bookkeeping in the source profile's runtime scope."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._run_post_turn_hooks_inner(
+                agent_result=agent_result,
+                source=source,
+                is_internal=is_internal,
+                event=event,
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            return await self._run_post_turn_hooks_inner(
+                agent_result=agent_result,
+                source=source,
+                is_internal=is_internal,
+                event=event,
+            )
+
+    async def _run_post_turn_hooks_inner(
+        self,
+        *,
+        agent_result: Any,
+        source: Any,
+        is_internal: bool,
+        event: Any = None,
+    ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
 
@@ -22849,8 +22875,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         # The --until judge is a sync aux-LLM call — keep it off the event loop.
-        decision = await asyncio.get_running_loop().run_in_executor(
-            None, mgr.complete_tick, final_response or ""
+        decision = await self._run_in_executor_with_context(
+            mgr.complete_tick, final_response or ""
         )
         msg = decision.get("message") or ""
         if msg and source is not None:

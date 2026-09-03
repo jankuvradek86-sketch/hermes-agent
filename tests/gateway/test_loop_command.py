@@ -249,6 +249,53 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
 
 
 @pytest.mark.asyncio
+async def test_post_turn_loop_completion_persists_in_multiplex_profile(
+    loop_env, monkeypatch
+):
+    """Completion must clear the same profile DB that the watcher claimed."""
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "coder"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        await asyncio.to_thread(goals._get_session_db)
+        mgr = loops.LoopManager(session_id="sid-gateway-loop")
+        state = mgr.set("poll CI", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert mgr.fire_tick() is not None
+        assert state.awaiting_response is True
+
+    runner = _make_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = [profile_name]
+    source = _make_event("wakeup").source
+    source.profile = profile_name
+
+    await GatewayRunner._run_post_turn_hooks(
+        runner,
+        agent_result={"final_response": "still working"},
+        source=source,
+        is_internal=True,
+    )
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        reloaded = loops.load_loop("sid-gateway-loop")
+        assert reloaded is not None
+        assert reloaded.awaiting_response is False
+        assert reloaded.status == "active"
+        assert reloaded.next_due_at > time.time()
+        assert loops.LoopManager(session_id="sid-gateway-loop").is_due(
+            now=reloaded.next_due_at
+        )
+    assert loops.load_loop("sid-gateway-loop") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("secondary_live", [True, False], ids=["live", "missing"])
 async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
     loop_env, monkeypatch, secondary_live
