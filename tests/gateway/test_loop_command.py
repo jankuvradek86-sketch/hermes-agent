@@ -501,6 +501,171 @@ async def test_loop_wakeup_watcher_uses_shared_adapter_for_matching_profile_rout
 
 
 @pytest.mark.asyncio
+async def test_loop_wakeup_watcher_reclaims_due_idle_awaiting_tick(
+    loop_env, monkeypatch
+):
+    """A terminal-path bookkeeping miss must not wedge an idle due loop."""
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    profile_name = "coder"
+    profile_home = loop_env / "profiles" / profile_name
+    profile_home.mkdir(parents=True)
+    sessions_dir = loop_env / "gateway-sessions"
+    config = GatewayConfig(
+        sessions_dir=sessions_dir,
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[profile_name],
+        profile_routes=[
+            ProfileRoute(
+                name="coder-discord",
+                platform="discord",
+                profile=profile_name,
+                guild_id="guild-7",
+                chat_id="secondary-channel",
+            )
+        ],
+    )
+    persisted_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="secondary-channel",
+        chat_type="group",
+        user_id="secondary-user",
+        scope_id="guild-7",
+        profile=profile_name,
+    )
+
+    with gateway_run._profile_runtime_scope(profile_home):
+        await asyncio.to_thread(goals._get_session_db)
+        store = SessionStore(sessions_dir, config)
+        session_entry = store.get_or_create_session(persisted_source)
+        manager = loops.LoopManager(session_id=session_entry.session_id)
+        state = manager.set(
+            "check the routed deploy",
+            interval_seconds=300,
+            route={
+                "platform": "discord",
+                "chat_id": "secondary-channel",
+                "chat_type": "group",
+                "user_id": "secondary-user",
+            },
+        )
+        state.ticks_fired = 1
+        state.awaiting_response = True
+        state.last_fired_at = time.time() - 600
+        state.next_due_at = time.time() - 300
+        loops.save_loop(session_entry.session_id, state)
+        store.close_all_db_handles()
+
+    shared_adapter = Mock()
+    shared_adapter.handle_message = AsyncMock()
+    shared_adapter._pending_messages = {}
+
+    runner = _make_runner()
+    runner.config = config
+    runner.session_store = SessionStore(sessions_dir, config)
+    runner.adapters = {Platform.DISCORD: shared_adapter}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._running = True
+    runner._warm_goals_session_db = AsyncMock()
+
+    sleep_calls = 0
+
+    async def _finish_after_one_scan(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+    try:
+        await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+    finally:
+        runner.session_store.close_all_db_handles()
+
+    shared_adapter.handle_message.assert_awaited_once()
+    with gateway_run._profile_runtime_scope(profile_home):
+        recovered = loops.load_loop(session_entry.session_id)
+        assert recovered is not None
+        assert recovered.awaiting_response is True
+        assert recovered.ticks_fired == 2
+        assert recovered.last_fired_at > state.last_fired_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocker",
+    ["active-runner", "pending-head", "queued-overflow", "adapter-owner-task"],
+)
+async def test_loop_wakeup_watcher_does_not_reclaim_busy_or_pending_tick(
+    loop_env, monkeypatch, blocker
+):
+    """A live turn or FIFO input keeps ownership of an awaiting loop claim."""
+    manager = loops.LoopManager(session_id="sid-gateway-loop")
+    state = manager.set(
+        "check the deploy",
+        interval_seconds=300,
+        route={
+            "platform": "discord",
+            "chat_id": "chat-loop",
+            "chat_type": "channel",
+            "user_id": "user-loop",
+        },
+    )
+    state.ticks_fired = 1
+    state.awaiting_response = True
+    state.last_fired_at = time.time() - 600
+    state.next_due_at = time.time() - 300
+    loops.save_loop("sid-gateway-loop", state)
+
+    adapter = Mock()
+    adapter.handle_message = AsyncMock()
+    adapter._pending_messages = {}
+    adapter._session_tasks = {}
+
+    runner = _make_runner()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._running_agents = {}
+    runner._running = True
+    runner._warm_goals_session_db = AsyncMock()
+    session_key = runner.session_store._generate_session_key(None)
+    pending_event = _make_event("user input wins")
+    if blocker == "active-runner":
+        runner._running_agents[session_key] = object()
+    elif blocker == "pending-head":
+        adapter._pending_messages[session_key] = pending_event
+    elif blocker == "queued-overflow":
+        runner._queued_events[session_key] = [pending_event]
+    else:
+        owner_task = Mock()
+        owner_task.done.return_value = False
+        adapter._session_tasks[session_key] = owner_task
+
+    sleep_calls = 0
+
+    async def _finish_after_one_scan(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _finish_after_one_scan)
+
+    await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+    adapter.handle_message.assert_not_awaited()
+    retained = loops.load_loop("sid-gateway-loop")
+    assert retained is not None
+    assert retained.awaiting_response is True
+    assert retained.ticks_fired == 1
+    assert retained.last_fired_at == state.last_fired_at
+
+
+@pytest.mark.asyncio
 async def test_post_turn_session_resolution_failure_is_logged(loop_env, caplog):
     runner = _make_runner()
     runner.session_store.get_or_create_session = Mock(side_effect=RuntimeError("store unavailable"))

@@ -721,6 +721,37 @@ class LoopManager:
         s.ticks_fired = max(0, s.ticks_fired - 1)
         save_loop(self.session_id, s)
 
+    def release_stale_tick_claim(self, now: Optional[float] = None) -> bool:
+        """Release an overdue claim after its gateway turn has disappeared.
+
+        The caller must first prove that the session has no active runner or
+        pending FIFO input. Unlike :meth:`abandon_tick`, this preserves the
+        tick count and cadence because the claimed tick really did run; only
+        its terminal bookkeeping was missed. Tick caps are applied before a
+        caller can claim another run.
+        """
+        s = self._state
+        check_at = now if now is not None else time.time()
+        if (
+            s is None
+            or s.status != "active"
+            or not s.awaiting_response
+            or check_at < s.next_due_at
+        ):
+            return False
+
+        s.awaiting_response = False
+        if s.times and s.ticks_fired >= s.times:
+            s.status = "done"
+            s.last_stop_reason = f"completed the requested {s.times} runs"
+        elif s.max_ticks and s.ticks_fired >= s.max_ticks:
+            s.status = "paused"
+            s.paused_reason = (
+                f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})"
+            )
+        save_loop(self.session_id, s)
+        return True
+
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 

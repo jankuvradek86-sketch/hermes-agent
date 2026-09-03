@@ -372,6 +372,47 @@ class TestTickLifecycle:
         assert mgr.state.awaiting_response is False
         assert mgr.state.ticks_fired == 0
 
+    def test_release_stale_tick_claim_preserves_prior_tick_and_due_cadence(
+        self, hermes_home
+    ):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t5-stale")
+        state = mgr.set("poll", interval_seconds=300)
+        state.ticks_fired = 1
+        state.awaiting_response = True
+        state.next_due_at = time.time() - 1
+        prior_due_at = state.next_due_at
+
+        assert mgr.release_stale_tick_claim(now=time.time()) is True
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.ticks_fired == 1
+        assert mgr.state.next_due_at == prior_due_at
+        assert mgr.fire_tick() is not None
+        assert mgr.state.ticks_fired == 2
+
+    @pytest.mark.parametrize(
+        ("times", "max_ticks", "expected_status"),
+        [(1, 100, "done"), (0, 1, "paused")],
+    )
+    def test_release_stale_tick_claim_honors_tick_caps(
+        self, hermes_home, times, max_ticks, expected_status
+    ):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id=f"t5-stale-cap-{expected_status}")
+        state = mgr.set("poll", interval_seconds=300, times=times)
+        state.max_ticks = max_ticks
+        state.ticks_fired = 1
+        state.awaiting_response = True
+        state.next_due_at = time.time() - 1
+
+        assert mgr.release_stale_tick_claim(now=time.time()) is True
+        assert mgr.state.status == expected_status
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.ticks_fired == 1
+        assert mgr.fire_tick() is None
+
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

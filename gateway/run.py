@@ -22910,7 +22910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             now = time.time()
             for sid, state in list_active_loops():
-                if state.awaiting_response or now < state.next_due_at:
+                if now < state.next_due_at:
                     continue
                 route = state.route or {}
                 platform_name = route.get("platform", "")
@@ -22981,12 +22981,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # load-bearing when a process-level route shares the primary
                 # adapter with a secondary profile runtime.
                 source._transport_adapter_ref = _weakref.ref(adapter)
-                if session_key and session_key in self._running_agents:
-                    continue  # busy — stays due, next scan retries
+                if session_key:
+                    if self._is_session_running(session_key):
+                        continue  # busy — stays due, next scan retries
+
+                    # A user turn queued ahead of the loop owns the idle
+                    # boundary. _queue_depth covers both the adapter FIFO head
+                    # and the runner's overflow tail. Bare test/proxy adapters
+                    # may expose a non-mapping mock in place of that optional
+                    # private queue; treat it as absent, never as live work.
+                    try:
+                        pending_depth = self._queue_depth(
+                            session_key, adapter=adapter
+                        )
+                    except (TypeError, AttributeError):
+                        pending_depth = 0
+                    if pending_depth > 0:
+                        continue
+
+                    # Cover the adapter-to-runner handoff window after the
+                    # FIFO head has been popped but before the runner installs
+                    # its pending sentinel. A completed owner task is stale
+                    # and must not keep the loop wedged.
+                    session_tasks = getattr(adapter, "_session_tasks", None)
+                    try:
+                        owner_task = (
+                            session_tasks.get(session_key)
+                            if session_tasks is not None
+                            else None
+                        )
+                    except (TypeError, AttributeError):
+                        owner_task = None
+                    if owner_task is not None:
+                        try:
+                            owner_active = not owner_task.done()
+                        except (AttributeError, TypeError):
+                            owner_active = True
+                        if owner_active:
+                            continue
                 if goal_blocks_loop_tick(sid):
                     continue
 
                 mgr = LoopManager(session_id=sid)
+                current_state = mgr.state
+                if current_state is not None and current_state.awaiting_response:
+                    # Reclaim only after reconstructing the durable session
+                    # identity and proving there is no live/queued work. The
+                    # prior tick ran, so do not use abandon_tick() here.
+                    if not session_key or not mgr.release_stale_tick_claim(now):
+                        continue
+                    logger.info(
+                        "loop wakeup: released stale tick claim for session %s",
+                        sid,
+                    )
                 if not mgr.is_due(now):
                     continue
                 wakeup = mgr.fire_tick()
