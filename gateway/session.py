@@ -1282,6 +1282,11 @@ class SessionStore:
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        # A route must not advance again while its predecessor->successor DB
+        # creation and loop migration are still in flight. get-or-create's
+        # single-flight does not cover reset_session(), so both entry points
+        # share these per-routing-key locks.
+        self._rotation_locks: Dict[str, Any] = {}
         # An unscoped pre-migration Slack key can represent at most one
         # workspace. Claim it once per process so simultaneous first messages
         # from two workspaces cannot both revive the same legacy session.
@@ -1594,6 +1599,64 @@ class SessionStore:
         if not session_id:
             return self._db
         return self._db_for_key(self._owner_key_for_session_id(session_id))
+
+    def _migrate_loop_after_rotation(
+        self,
+        session_key: str,
+        old_session_id: Optional[str],
+        new_session_id: Optional[str],
+        *,
+        reason: str,
+    ) -> None:
+        """Best-effort /loop migration in the routing key's profile store."""
+        if (
+            not old_session_id
+            or not new_session_id
+            or old_session_id == new_session_id
+        ):
+            return
+
+        home_token = None
+        reset_home_override = None
+        try:
+            session_db = self._db_for_key(session_key)
+            if session_db is None:
+                return
+            profile = self._named_profile_for_key(session_key)
+            if profile is not None:
+                profile_home = self._profile_home_for_key(session_key)
+                if profile_home is None:
+                    return
+                from hermes_constants import (
+                    reset_hermes_home_override,
+                    set_hermes_home_override,
+                )
+
+                home_token = set_hermes_home_override(profile_home)
+                reset_home_override = reset_hermes_home_override
+
+            from hermes_cli.loops import migrate_loop_to_session
+
+            migrate_loop_to_session(
+                old_session_id,
+                new_session_id,
+                reason=reason,
+                db=session_db,
+                follow_migrated=True,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not migrate loop on gateway session rotation %s -> %s: %s",
+                old_session_id,
+                new_session_id,
+                exc,
+            )
+        finally:
+            if home_token is not None and reset_home_override is not None:
+                try:
+                    reset_home_override(home_token)
+                except Exception:
+                    pass
 
     def close_all_db_handles(self) -> None:
         """Close every SessionDB handle this store opened, one per resolved path.
@@ -2885,11 +2948,12 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(
-                source,
-                force_new=force_new,
-                touch_activity=touch_activity,
-            )
+            with self._rotation_lock_for_key(session_key):
+                result = self._get_or_create_session_impl(
+                    source,
+                    force_new=force_new,
+                    touch_activity=touch_activity,
+                )
             slot.result = result
             return result
         except BaseException as exc:
@@ -2899,6 +2963,25 @@ class SessionStore:
             slot.event.set()
             with inflight_lock:
                 self._inflight_sessions.pop(session_key, None)
+
+    def _rotation_lock_for_key(self, session_key: str):
+        """Return the lock linearizing successor publication for one route."""
+        registry_lock = getattr(self, "_inflight_lock", None)
+        if registry_lock is None:
+            # Compatibility for focused tests that construct a bare store.
+            registry_lock = threading.Lock()
+            self._inflight_lock = registry_lock
+            self._inflight_sessions = {}
+        with registry_lock:
+            rotation_locks = getattr(self, "_rotation_locks", None)
+            if rotation_locks is None:
+                rotation_locks = {}
+                self._rotation_locks = rotation_locks
+            lock = rotation_locks.get(session_key)
+            if lock is None:
+                lock = threading.RLock()
+                rotation_locks[session_key] = lock
+            return lock
 
     def _get_or_create_session_impl(
         self,
@@ -3234,6 +3317,18 @@ class SessionStore:
         if self._db_for_key(session_key) and db_create_kwargs:
             try:
                 self._db_for_key(session_key).create_session(**db_create_kwargs)
+                loop_predecessor_id = prev_session_id
+                if (
+                    loop_predecessor_id is None
+                    and force_new_observed_entry is not None
+                ):
+                    loop_predecessor_id = force_new_observed_entry.session_id
+                self._migrate_loop_after_rotation(
+                    session_key,
+                    loop_predecessor_id,
+                    session_id,
+                    reason=auto_reset_reason or "session_rotation",
+                )
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
@@ -3650,6 +3745,14 @@ class SessionStore:
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
+        with self._rotation_lock_for_key(session_key):
+            return self._reset_session_impl(session_key, display_name)
+
+    def _reset_session_impl(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -3726,6 +3829,12 @@ class SessionStore:
         if self._db_for_key(session_key) and db_create_kwargs:
             try:
                 self._db_for_key(session_key).create_session(**db_create_kwargs)
+                self._migrate_loop_after_rotation(
+                    session_key,
+                    db_end_session_id,
+                    session_id,
+                    reason="session_reset",
+                )
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,

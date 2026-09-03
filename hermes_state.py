@@ -16241,6 +16241,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def compare_and_set_meta_batch(
+        self,
+        expected: Dict[str, Optional[str]],
+        updates: Dict[str, str],
+    ) -> bool:
+        """Atomically apply meta updates when every expected value matches.
+
+        ``None`` in ``expected`` means the key must not exist.  All update
+        keys must be guarded so callers cannot accidentally mix conditional
+        and unconditional writes in the same transaction.
+        """
+        if not updates:
+            return True
+        if not set(updates).issubset(expected):
+            raise ValueError("every state_meta update must have an expected value")
+
+        def _do(conn):
+            for key, expected_value in expected.items():
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                if expected_value is None:
+                    if row is not None:
+                        return False
+                elif row is None or row[0] != expected_value:
+                    return False
+
+            for key, value in updates.items():
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 

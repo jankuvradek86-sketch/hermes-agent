@@ -78,6 +78,10 @@ DEFAULT_SELF_PACED_CEILING_SECONDS = 15 * 60
 # the loop's task is finished or no longer applicable.
 LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
 
+
+class LoopPersistenceError(RuntimeError):
+    """A requested loop mutation could not be durably persisted."""
+
 # Matches the marker on its own line (possibly with surrounding whitespace
 # or trailing punctuation the model added despite instructions).
 _LOOP_COMPLETE_RE = re.compile(
@@ -313,6 +317,14 @@ class LoopState:
     # tick back into the right chat. Empty for CLI / TUI sessions, which
     # drive ticks from their own session-local schedulers.
     route: Dict[str, str] = field(default_factory=dict)
+    # Monotonic persisted revision used to reject writes from managers that
+    # loaded this loop before another process changed or migrated it. Kept at
+    # the end so existing positional LoopState construction remains valid.
+    generation: int = 0
+    # Durable terminal marker for session rotation. Unlike an ordinary user
+    # clear, a migrated predecessor must never be reactivated: its logical
+    # loop now belongs to this successor session.
+    migrated_to: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -324,6 +336,8 @@ class LoopState:
         return cls(
             prompt=data.get("prompt", ""),
             status=data.get("status", "active"),
+            generation=max(0, int(data.get("generation", 0) or 0)),
+            migrated_to=str(data.get("migrated_to", "") or ""),
             mode=data.get("mode", "interval"),
             interval_seconds=float(data.get("interval_seconds", 0.0) or 0.0),
             current_delay=float(data.get("current_delay", 0.0) or 0.0),
@@ -363,6 +377,8 @@ class LoopState:
 # ──────────────────────────────────────────────────────────────────────
 
 _META_PREFIX = "loop:"
+_MIGRATION_CAS_ATTEMPTS = 3
+_MIGRATION_CHAIN_MAX_HOPS = 16
 
 
 def _meta_key(session_id: str) -> str:
@@ -411,18 +427,64 @@ def load_loop(session_id: str) -> Optional[LoopState]:
 
 def save_loop(session_id: str, state: LoopState) -> None:
     """Persist a loop to SessionDB. No-op if DB unavailable."""
+    _save_loop_if_current(session_id, state)
+
+
+def _state_json_at_generation(state: LoopState, generation: int) -> str:
+    data = asdict(state)
+    data["generation"] = generation
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _save_loop_if_current(session_id: str, state: LoopState) -> Optional[bool]:
+    """Persist ``state`` only while its generation is still authoritative.
+
+    Returns True on success, False on a compare-and-set conflict, and None
+    when persistence is unavailable or fails (the historical best-effort
+    behavior).  The caller's generation advances only after a durable write.
+    """
     if not session_id:
-        return
+        return None
     db = _get_session_db()
     if db is None:
         from hermes_cli.goals import _warn_dropped_write
 
         _warn_dropped_write("LoopManager", "loop", session_id)
-        return
+        return None
+    key = _meta_key(session_id)
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        current_raw = db.get_meta(key)
+        if current_raw is None:
+            if state.generation != 0:
+                return False
+        else:
+            current = LoopState.from_json(current_raw)
+            if current.generation != state.generation:
+                return False
+            if current.migrated_to:
+                # Migration tombstones are immutable. Generation equality is
+                # not sufficient after a rejected stale write refreshes its
+                # manager to the predecessor's latest persisted revision.
+                return False
+
+        next_generation = state.generation + 1
+        next_raw = _state_json_at_generation(state, next_generation)
+        saved = db.compare_and_set_meta_batch(
+            {key: current_raw},
+            {key: next_raw},
+        )
+        if saved:
+            state.generation = next_generation
+            return True
+        logger.debug(
+            "LoopManager: stale loop write rejected for %s at generation %s",
+            session_id,
+            state.generation,
+        )
+        return False
     except Exception as exc:
         logger.debug("LoopManager: set_meta failed: %s", exc)
+        return None
 
 
 def clear_loop(session_id: str) -> None:
@@ -463,30 +525,135 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     return out
 
 
-def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+def migrate_loop_to_session(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    reason: str = "",
+    db: Optional[Any] = None,
+    follow_migrated: bool = False,
+) -> bool:
     """Carry a persistent /loop from a parent session to its continuation.
 
     Context compression rotates ``session_id`` to a fresh child session;
     without this the loop silently dies at the compaction boundary (the
     same hazard /goal hit in #33618). Copies the loop onto the new session
     and archives the old row as ``cleared`` so exactly one active loop row
-    exists per logical conversation. Best-effort and never raises.
+    exists per logical conversation. An existing destination wins unchanged;
+    compare-and-set conflicts are retried a bounded number of times.
+
+    ``follow_migrated`` is reserved for a caller that owns a newer routing
+    transition (gateway reset/auto-reset/force-new). It follows durable
+    predecessor tombstones to the current descendant before migrating that
+    state to ``new_session_id``. Compression leaves this disabled so a stale
+    compressor can never pull a loop back from a newer gateway target.
+    Best-effort and never raises.
     """
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
+    session_db = db if db is not None else _get_session_db()
+    if session_db is None:
+        return False
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared":
-            return False
-        if load_loop(new_session_id) is not None:
-            return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
-        logger.debug(
-            "LoopManager: migrated loop %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
+        new_key = _meta_key(new_session_id)
+        source_session_id = old_session_id
+        visited: set[str] = set()
+        followed_hops = 0
+
+        while True:
+            if source_session_id == new_session_id:
+                target_raw = session_db.get_meta(new_key)
+                if target_raw is None:
+                    return False
+                return LoopState.from_json(target_raw).status != "cleared"
+            if source_session_id in visited:
+                logger.debug(
+                    "LoopManager: loop migration forwarding cycle at %s",
+                    source_session_id,
+                )
+                return False
+            visited.add(source_session_id)
+
+            source_key = _meta_key(source_session_id)
+            forwarded_to = None
+            for attempt in range(1, _MIGRATION_CAS_ATTEMPTS + 1):
+                source_raw = session_db.get_meta(source_key)
+                new_raw = session_db.get_meta(new_key)
+                if source_raw is None:
+                    return False
+                state = LoopState.from_json(source_raw)
+                if state.status == "cleared":
+                    if not follow_migrated or not state.migrated_to:
+                        return False
+                    forwarded_to = state.migrated_to
+                    break
+
+                next_generation = state.generation + 1
+                predecessor_data = asdict(state)
+                predecessor_data["status"] = "cleared"
+                predecessor_data["generation"] = next_generation
+                predecessor_data["migrated_to"] = new_session_id
+                predecessor_raw = json.dumps(predecessor_data, ensure_ascii=False)
+                updates = {source_key: predecessor_raw}
+                if new_raw is None:
+                    successor_data = asdict(state)
+                    successor_data["generation"] = next_generation
+                    successor_data["migrated_to"] = ""
+                    # Successor first makes a later predecessor failure exercise
+                    # rollback of an otherwise-valid insert.
+                    updates = {
+                        new_key: json.dumps(successor_data, ensure_ascii=False),
+                        source_key: predecessor_raw,
+                    }
+
+                migrated = session_db.compare_and_set_meta_batch(
+                    {source_key: source_raw, new_key: new_raw},
+                    updates,
+                )
+                if migrated:
+                    logger.debug(
+                        "LoopManager: migrated loop %s -> %s (%s%s%s)",
+                        source_session_id,
+                        new_session_id,
+                        reason or "rotation",
+                        ", target preserved" if new_raw is not None else "",
+                        (
+                            f", followed from {old_session_id}"
+                            if source_session_id != old_session_id
+                            else ""
+                        ),
+                    )
+                    return True
+                logger.debug(
+                    "LoopManager: loop migration CAS conflict on attempt %s/%s",
+                    attempt,
+                    _MIGRATION_CAS_ATTEMPTS,
+                )
+
+            if forwarded_to is None:
+                # The final failed CAS may itself have lost to a migration.
+                # Re-read once without spending another write attempt so a
+                # gateway owner can follow the tombstone that caused the last
+                # conflict. Other conflicts still fail closed at the bound.
+                source_raw = session_db.get_meta(source_key)
+                if source_raw is None:
+                    return False
+                state = LoopState.from_json(source_raw)
+                if (
+                    not follow_migrated
+                    or state.status != "cleared"
+                    or not state.migrated_to
+                ):
+                    return False
+                forwarded_to = state.migrated_to
+            if followed_hops >= _MIGRATION_CHAIN_MAX_HOPS:
+                logger.debug(
+                    "LoopManager: loop migration forwarding exceeded %s hops",
+                    _MIGRATION_CHAIN_MAX_HOPS,
+                )
+                return False
+            followed_hops += 1
+            source_session_id = forwarded_to
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("LoopManager: loop migration failed: %s", exc)
         return False
@@ -542,6 +709,28 @@ class LoopManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._state: Optional[LoopState] = load_loop(session_id)
+
+    def _persist(self) -> bool:
+        if self._state is None:
+            return False
+        saved = _save_loop_if_current(self.session_id, self._state)
+        if saved is not True:
+            # A newer persisted generation is authoritative. In particular,
+            # migration leaves the predecessor terminal, so this refresh also
+            # prevents the stale in-memory manager from scheduling a wakeup.
+            self.refresh()
+            return False
+        return True
+
+    def _persistence_failure_decision(self) -> Dict[str, Any]:
+        status = self._state.status if self._state is not None else None
+        return {
+            "status": status,
+            "stopped": status in {"done", "paused", "cleared"},
+            "reason": "loop state changed or persistence failed before the update was durable",
+            "message": "",
+            "persisted": False,
+        }
 
     # --- introspection ------------------------------------------------
 
@@ -608,6 +797,19 @@ class LoopManager:
         if not prompt:
             raise ValueError("loop prompt is empty")
 
+        prior_state = self._state
+        if prior_state is None:
+            # clear() intentionally removes the local active state. Re-read
+            # the durable row so an ordinary clear can be replaced using its
+            # current generation without weakening the CAS.
+            prior_state = load_loop(self.session_id)
+            self._state = prior_state
+        if prior_state is not None and prior_state.migrated_to:
+            raise LoopPersistenceError(
+                "could not persist loop: session migrated to "
+                f"{prior_state.migrated_to}"
+            )
+
         now = time.time()
         if interval_seconds is not None:
             interval = max(int(interval_seconds), min_interval_seconds())
@@ -627,13 +829,21 @@ class LoopManager:
                 current_delay=float(floor),
                 next_due_at=now,
             )
+        if prior_state is not None:
+            state.generation = prior_state.generation
         state.times = max(0, int(times or 0))
         state.until = (until or "").strip()
         state.max_ticks = max_ticks_default()
         state.created_at = now
         state.route = dict(route or {})
         self._state = state
-        save_loop(self.session_id, state)
+        if not self._persist():
+            if self._state is not None and self._state.migrated_to:
+                raise LoopPersistenceError(
+                    "could not persist loop: session migrated to "
+                    f"{self._state.migrated_to}"
+                )
+            raise LoopPersistenceError("could not persist loop state")
         return state
 
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
@@ -642,7 +852,8 @@ class LoopManager:
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._state.awaiting_response = False
-        save_loop(self.session_id, self._state)
+        if not self._persist():
+            return None
         return self._state
 
     def resume(self) -> Optional[LoopState]:
@@ -654,24 +865,26 @@ class LoopManager:
         # Re-arm relative to now so a long pause doesn't fire instantly N times.
         delay = self._state.current_delay or self._state.interval_seconds or self_paced_floor_seconds()
         self._state.next_due_at = time.time() + min(delay, 5.0)
-        save_loop(self.session_id, self._state)
+        if not self._persist():
+            return None
         return self._state
 
     def clear(self) -> bool:
         if self._state is None or self._state.status == "cleared":
             return False
         self._state.status = "cleared"
-        save_loop(self.session_id, self._state)
+        if not self._persist():
+            return False
         self._state = None
         return True
 
-    def mark_done(self, reason: str) -> None:
+    def mark_done(self, reason: str) -> bool:
         if not self._state:
-            return
+            return False
         self._state.status = "done"
         self._state.last_stop_reason = reason
         self._state.awaiting_response = False
-        save_loop(self.session_id, self._state)
+        return self._persist()
 
     # --- tick lifecycle -------------------------------------------------
 
@@ -704,7 +917,8 @@ class LoopManager:
         # schedule keeps the persisted loop from being 'due' in a tight loop.
         delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
         s.next_due_at = s.last_fired_at + delay
-        save_loop(self.session_id, s)
+        if not self._persist():
+            return None
 
         if s.prompt.lstrip().startswith("/"):
             return s.prompt.strip()
@@ -712,14 +926,14 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
-    def abandon_tick(self) -> None:
+    def abandon_tick(self) -> bool:
         """Roll back a fired tick whose injection failed (nothing ran)."""
         s = self._state
         if s is None or not s.awaiting_response:
-            return
+            return False
         s.awaiting_response = False
         s.ticks_fired = max(0, s.ticks_fired - 1)
-        save_loop(self.session_id, s)
+        return self._persist()
 
     def release_stale_tick_claim(self, now: Optional[float] = None) -> bool:
         """Release an overdue claim after its gateway turn has disappeared.
@@ -749,8 +963,7 @@ class LoopManager:
             s.paused_reason = (
                 f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})"
             )
-        save_loop(self.session_id, s)
-        return True
+        return self._persist()
 
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
@@ -762,6 +975,8 @@ class LoopManager:
 
         ``message`` is a user-visible one-liner ("" when nothing worth
         saying — the common still-looping case stays quiet).
+        Persistence failures return the refreshed authoritative status plus
+        ``persisted=False`` and never return an attempted completion message.
         """
         s = self._state
         if s is None or not s.awaiting_response:
@@ -773,7 +988,8 @@ class LoopManager:
         if response_signals_complete(last_response):
             s.status = "done"
             s.last_stop_reason = "agent signaled the task is complete"
-            save_loop(self.session_id, s)
+            if not self._persist():
+                return self._persistence_failure_decision()
             return {
                 "status": "done",
                 "stopped": True,
@@ -792,7 +1008,8 @@ class LoopManager:
             if verdict == "done":
                 s.status = "done"
                 s.last_stop_reason = f"stop condition met: {reason}"
-                save_loop(self.session_id, s)
+                if not self._persist():
+                    return self._persistence_failure_decision()
                 return {
                     "status": "done",
                     "stopped": True,
@@ -804,7 +1021,8 @@ class LoopManager:
                 # until the tick budget; pause so the user can re-scope.
                 s.status = "paused"
                 s.paused_reason = f"stop condition judged unachievable: {reason}"
-                save_loop(self.session_id, s)
+                if not self._persist():
+                    return self._persistence_failure_decision()
                 return {
                     "status": "paused",
                     "stopped": True,
@@ -816,7 +1034,8 @@ class LoopManager:
         if s.times and s.ticks_fired >= s.times:
             s.status = "done"
             s.last_stop_reason = f"completed the requested {s.times} runs"
-            save_loop(self.session_id, s)
+            if not self._persist():
+                return self._persistence_failure_decision()
             return {
                 "status": "done",
                 "stopped": True,
@@ -828,7 +1047,8 @@ class LoopManager:
         if s.max_ticks and s.ticks_fired >= s.max_ticks:
             s.status = "paused"
             s.paused_reason = f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})"
-            save_loop(self.session_id, s)
+            if not self._persist():
+                return self._persistence_failure_decision()
             return {
                 "status": "paused",
                 "stopped": True,
@@ -853,7 +1073,8 @@ class LoopManager:
         else:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
-        save_loop(self.session_id, s)
+        if not self._persist():
+            return self._persistence_failure_decision()
         return {
             "status": "active",
             "stopped": False,
@@ -965,7 +1186,7 @@ def dispatch_loop_command(
             until=parsed["until"],
             route=route,
         )
-    except ValueError as exc:
+    except (ValueError, LoopPersistenceError) as exc:
         return {"output": f"/loop: {exc}", "created": False}
 
     lines = [f"↻ Loop set ({state.cadence_label()}): {state.prompt}"]
@@ -997,6 +1218,7 @@ def dispatch_loop_command(
 __all__ = [
     "LoopState",
     "LoopManager",
+    "LoopPersistenceError",
     "parse_loop_args",
     "parse_interval_token",
     "format_interval",

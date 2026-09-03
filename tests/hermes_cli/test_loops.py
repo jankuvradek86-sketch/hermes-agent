@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
@@ -264,6 +266,10 @@ class TestPersistence:
         cleared = load_loop("sess-1")
         assert cleared is not None and cleared.status == "cleared"
 
+        restarted = mgr.set("check it again", interval_seconds=300)
+        assert restarted.status == "active"
+        assert load_loop("sess-1").prompt == "check it again"
+
     def test_list_active_loops(self, hermes_home):
         from hermes_cli.loops import LoopManager, list_active_loops
 
@@ -277,14 +283,236 @@ class TestPersistence:
         assert "b" not in active
 
     def test_migrate_to_session(self, hermes_home):
-        from hermes_cli.loops import LoopManager, load_loop, migrate_loop_to_session
+        from hermes_cli.loops import (
+            LoopManager,
+            list_active_loops,
+            load_loop,
+            migrate_loop_to_session,
+            save_loop,
+        )
 
-        LoopManager(session_id="parent").set("watch it", interval_seconds=60)
+        expected = LoopManager(session_id="parent").set(
+            "watch it",
+            interval_seconds=60,
+            times=7,
+            until="the deploy is healthy",
+            route={"platform": "telegram", "chat_id": "42"},
+        )
+        expected.current_delay = 91.0
+        expected.ticks_fired = 3
+        expected.last_fired_at = 123.5
+        expected.next_due_at = 456.75
+        expected.awaiting_response = True
+        expected.last_response_digest = "digest-3"
+        expected.paused_reason = "preserved metadata"
+        expected.last_stop_reason = "also preserved"
+        save_loop("parent", expected)
+        expected_fields = asdict(expected)
+        expected_generation = expected_fields.pop("generation")
+
         assert migrate_loop_to_session("parent", "child", reason="compression") is True
         child = load_loop("child")
-        assert child is not None and child.prompt == "watch it"
+        assert child is not None
+        child_fields = asdict(child)
+        child_generation = child_fields.pop("generation")
+        assert child_fields == expected_fields
+        assert child_generation == expected_generation + 1
         parent = load_loop("parent")
         assert parent is not None and parent.status == "cleared"
+        assert parent.generation == child_generation
+        assert [session_id for session_id, _state in list_active_loops()] == ["child"]
+
+    def test_migrate_successor_write_failure_keeps_predecessor_active(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="parent-write-fail").set(
+            "watch it", interval_seconds=60
+        )
+        db = loops._get_session_db()
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TRIGGER fail_loop_successor_write
+                BEFORE INSERT ON state_meta
+                WHEN NEW.key = 'loop:child-write-fail'
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected successor write failure');
+                END
+                """
+            )
+        )
+
+        assert (
+            loops.migrate_loop_to_session(
+                "parent-write-fail", "child-write-fail", reason="test"
+            )
+            is False
+        )
+        assert loops.load_loop("parent-write-fail").status == "active"
+        assert loops.load_loop("child-write-fail") is None
+
+    def test_migrate_predecessor_clear_failure_rolls_back_successor(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="parent-clear-fail").set(
+            "watch it", interval_seconds=60
+        )
+        db = loops._get_session_db()
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TRIGGER fail_loop_predecessor_clear
+                BEFORE UPDATE OF value ON state_meta
+                WHEN OLD.key = 'loop:parent-clear-fail'
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected predecessor clear failure');
+                END
+                """
+            )
+        )
+
+        assert (
+            loops.migrate_loop_to_session(
+                "parent-clear-fail", "child-clear-fail", reason="test"
+            )
+            is False
+        )
+        assert loops.load_loop("parent-clear-fail").status == "active"
+        assert loops.load_loop("child-clear-fail") is None
+
+    def test_stale_manager_cannot_reactivate_migrated_predecessor(self, hermes_home):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="parent-stale").set(
+            "watch it", interval_seconds=60
+        )
+        stale = loops.LoopManager(session_id="parent-stale")
+
+        assert loops.migrate_loop_to_session("parent-stale", "child-stale") is True
+        stale.state.next_due_at = time.time() - 1
+
+        assert stale.fire_tick() is None
+        with pytest.raises(loops.LoopPersistenceError, match="migrated"):
+            stale.set("reactivate predecessor", interval_seconds=60)
+
+        assert loops.load_loop("parent-stale").status == "cleared"
+        assert loops.load_loop("parent-stale").migrated_to == "child-stale"
+        assert loops.load_loop("child-stale").status == "active"
+        assert [session_id for session_id, _state in loops.list_active_loops()] == [
+            "child-stale"
+        ]
+
+    def test_gateway_migration_follows_compression_descendant_chain(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="chain-root").set(
+            "follow the route", interval_seconds=60
+        )
+        assert loops.migrate_loop_to_session("chain-root", "compression-one")
+        assert loops.migrate_loop_to_session("compression-one", "compression-two")
+
+        assert loops.migrate_loop_to_session(
+            "chain-root",
+            "gateway-target",
+            follow_migrated=True,
+        )
+
+        assert loops.load_loop("chain-root").migrated_to == "compression-one"
+        assert loops.load_loop("compression-one").migrated_to == "compression-two"
+        assert loops.load_loop("compression-two").migrated_to == "gateway-target"
+        assert [session_id for session_id, _state in loops.list_active_loops()] == [
+            "gateway-target"
+        ]
+
+    def test_stale_compression_does_not_follow_gateway_migration(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="gateway-first-root").set(
+            "stay current", interval_seconds=60
+        )
+        assert loops.migrate_loop_to_session(
+            "gateway-first-root",
+            "gateway-first-target",
+            follow_migrated=True,
+        )
+
+        assert not loops.migrate_loop_to_session(
+            "gateway-first-root",
+            "stale-compression-target",
+        )
+        assert loops.load_loop("stale-compression-target") is None
+        assert [session_id for session_id, _state in loops.list_active_loops()] == [
+            "gateway-first-target"
+        ]
+
+    def test_gateway_migration_rejects_forwarding_cycle(self, hermes_home):
+        from hermes_cli import loops
+
+        db = loops._get_session_db()
+        db.set_meta(
+            loops._meta_key("cycle-a"),
+            loops.LoopState(
+                prompt="cycle",
+                status="cleared",
+                migrated_to="cycle-b",
+            ).to_json(),
+        )
+        db.set_meta(
+            loops._meta_key("cycle-b"),
+            loops.LoopState(
+                prompt="cycle",
+                status="cleared",
+                migrated_to="cycle-a",
+            ).to_json(),
+        )
+
+        assert not loops.migrate_loop_to_session(
+            "cycle-a",
+            "cycle-target",
+            follow_migrated=True,
+            db=db,
+        )
+        assert loops.load_loop("cycle-target") is None
+
+    def test_gateway_migration_bounds_forwarding_chain(self, hermes_home):
+        from hermes_cli import loops
+
+        db = loops._get_session_db()
+        nodes = [
+            f"bounded-{index}"
+            for index in range(loops._MIGRATION_CHAIN_MAX_HOPS + 2)
+        ]
+        for current, successor in zip(nodes, nodes[1:]):
+            db.set_meta(
+                loops._meta_key(current),
+                loops.LoopState(
+                    prompt="bounded",
+                    status="cleared",
+                    migrated_to=successor,
+                ).to_json(),
+            )
+        loops.LoopManager(session_id=nodes[-1]).set(
+            "bounded active", interval_seconds=60
+        )
+
+        assert not loops.migrate_loop_to_session(
+            nodes[0],
+            "bounded-target",
+            follow_migrated=True,
+            db=db,
+        )
+        assert loops.load_loop("bounded-target") is None
+        assert [session_id for session_id, _state in loops.list_active_loops()] == [
+            nodes[-1]
+        ]
 
     def test_migrate_no_source(self, hermes_home):
         from hermes_cli.loops import migrate_loop_to_session
@@ -292,13 +520,350 @@ class TestPersistence:
         assert migrate_loop_to_session("nope", "child2") is False
         assert migrate_loop_to_session("same", "same") is False
 
-    def test_migrate_does_not_clobber_child(self, hermes_home):
-        from hermes_cli.loops import LoopManager, load_loop, migrate_loop_to_session
+    def test_migrate_target_wins_and_predecessor_is_cleared(self, hermes_home):
+        from hermes_cli.loops import (
+            LoopManager,
+            list_active_loops,
+            load_loop,
+            migrate_loop_to_session,
+            save_loop,
+        )
 
         LoopManager(session_id="p2").set("parent loop", interval_seconds=60)
-        LoopManager(session_id="c2").set("child loop", interval_seconds=60)
-        assert migrate_loop_to_session("p2", "c2") is False
-        assert load_loop("c2").prompt == "child loop"
+        target = LoopManager(session_id="c2").set(
+            "child loop", interval_seconds=120, times=9
+        )
+        target.ticks_fired = 4
+        target.route = {"platform": "telegram", "chat_id": "target"}
+        save_loop("c2", target)
+        target_raw = target.to_json()
+
+        assert migrate_loop_to_session("p2", "c2") is True
+        assert load_loop("c2").to_json() == target_raw
+        assert load_loop("p2").status == "cleared"
+        assert [session_id for session_id, _state in list_active_loops()] == ["c2"]
+
+    def test_tick_committed_before_migration_is_carried_to_successor(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        mgr = loops.LoopManager(session_id="tick-wins-parent")
+        mgr.set("poll", interval_seconds=60)
+        assert mgr.fire_tick() is not None
+        claimed = loops.load_loop("tick-wins-parent")
+
+        assert loops.migrate_loop_to_session(
+            "tick-wins-parent", "tick-wins-child"
+        )
+        child = loops.load_loop("tick-wins-child")
+        assert child.ticks_fired == claimed.ticks_fired == 1
+        assert child.awaiting_response is claimed.awaiting_response is True
+        assert child.last_fired_at == claimed.last_fired_at
+        assert child.next_due_at == claimed.next_due_at
+        assert loops.load_loop("tick-wins-parent").status == "cleared"
+
+    def test_migration_retries_bounded_cas_conflict(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="retry-parent").set(
+            "poll", interval_seconds=60
+        )
+        db = loops._get_session_db()
+        real_compare = db.compare_and_set_meta_batch
+        calls = 0
+
+        def conflict_once(expected, updates):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return False
+            return real_compare(expected, updates)
+
+        monkeypatch.setattr(db, "compare_and_set_meta_batch", conflict_once)
+
+        assert loops.migrate_loop_to_session(
+            "retry-parent", "retry-child", db=db
+        )
+        assert calls == 2
+        assert loops.load_loop("retry-parent").status == "cleared"
+        assert loops.load_loop("retry-child").status == "active"
+
+    def test_migration_stops_after_bounded_cas_conflicts(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="retry-bound-parent").set(
+            "poll", interval_seconds=60
+        )
+        db = loops._get_session_db()
+        calls = 0
+
+        def always_conflict(_expected, _updates):
+            nonlocal calls
+            calls += 1
+            return False
+
+        monkeypatch.setattr(db, "compare_and_set_meta_batch", always_conflict)
+
+        assert loops.migrate_loop_to_session(
+            "retry-bound-parent", "retry-bound-child", db=db
+        ) is False
+        assert calls == 3
+        assert loops.load_loop("retry-bound-parent").status == "active"
+        assert loops.load_loop("retry-bound-child") is None
+
+    def test_gateway_follows_migration_winning_final_cas_conflict(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import loops
+
+        root = "final-conflict-root"
+        compression_child = "final-conflict-compression"
+        gateway_target = "final-conflict-gateway"
+        loops.LoopManager(session_id=root).set("poll", interval_seconds=60)
+        db = loops._get_session_db()
+        real_compare = db.compare_and_set_meta_batch
+        calls = 0
+
+        def compression_wins_final_attempt(expected, updates):
+            nonlocal calls
+            calls += 1
+            if calls < loops._MIGRATION_CAS_ATTEMPTS:
+                return False
+            if calls == loops._MIGRATION_CAS_ATTEMPTS:
+                root_key = loops._meta_key(root)
+                child_key = loops._meta_key(compression_child)
+                root_raw = db.get_meta(root_key)
+                source = loops.LoopState.from_json(root_raw)
+                next_generation = source.generation + 1
+                predecessor = loops.LoopState.from_json(root_raw)
+                predecessor.status = "cleared"
+                predecessor.generation = next_generation
+                predecessor.migrated_to = compression_child
+                successor = loops.LoopState.from_json(root_raw)
+                successor.generation = next_generation
+                assert real_compare(
+                    {root_key: root_raw, child_key: None},
+                    {
+                        child_key: successor.to_json(),
+                        root_key: predecessor.to_json(),
+                    },
+                )
+                return False
+            return real_compare(expected, updates)
+
+        monkeypatch.setattr(
+            db,
+            "compare_and_set_meta_batch",
+            compression_wins_final_attempt,
+        )
+
+        assert loops.migrate_loop_to_session(
+            root,
+            gateway_target,
+            db=db,
+            follow_migrated=True,
+        )
+        assert calls == loops._MIGRATION_CAS_ATTEMPTS + 1
+        assert [session_id for session_id, _state in loops.list_active_loops()] == [
+            gateway_target
+        ]
+
+    def test_atomic_meta_batch_conflict_applies_no_updates(self, hermes_home):
+        from hermes_cli import loops
+
+        db = loops._get_session_db()
+        db.set_meta("batch:first", "old-first")
+
+        assert db.compare_and_set_meta_batch(
+            {"batch:first": "wrong", "batch:second": None},
+            {"batch:first": "new-first", "batch:second": "new-second"},
+        ) is False
+        assert db.get_meta("batch:first") == "old-first"
+        assert db.get_meta("batch:second") is None
+
+    def test_atomic_meta_batch_write_failure_rolls_back_all_updates(
+        self, hermes_home
+    ):
+        from hermes_cli import loops
+
+        db = loops._get_session_db()
+        db.set_meta("batch:rollback-first", "old-first")
+        db.set_meta("batch:rollback-second", "old-second")
+        db._execute_write(
+            lambda conn: conn.execute(
+                """
+                CREATE TRIGGER fail_batch_second_update
+                BEFORE UPDATE OF value ON state_meta
+                WHEN OLD.key = 'batch:rollback-second'
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected batch write failure');
+                END
+                """
+            )
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected batch write failure"):
+            db.compare_and_set_meta_batch(
+                {
+                    "batch:rollback-first": "old-first",
+                    "batch:rollback-second": "old-second",
+                },
+                {
+                    "batch:rollback-first": "new-first",
+                    "batch:rollback-second": "new-second",
+                },
+            )
+        assert db.get_meta("batch:rollback-first") == "old-first"
+        assert db.get_meta("batch:rollback-second") == "old-second"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistence failure / stale-manager contracts
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestPersistenceFailureContracts:
+    def test_fire_tick_db_failure_emits_no_prompt_without_durable_claim(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import loops
+
+        mgr = loops.LoopManager(session_id="fire-write-failure")
+        state = mgr.set("poll", interval_seconds=60)
+        state.next_due_at = time.time() - 1
+        db = loops._get_session_db()
+
+        def fail_compare(*_args, **_kwargs):
+            raise OSError("injected CAS persistence failure")
+
+        monkeypatch.setattr(db, "compare_and_set_meta_batch", fail_compare)
+
+        assert mgr.fire_tick() is None
+        assert mgr.state.ticks_fired == 0
+        assert mgr.state.awaiting_response is False
+
+    def test_stale_set_raises_instead_of_returning_unsaved_state(self, hermes_home):
+        from hermes_cli import loops
+
+        loops.LoopManager(session_id="stale-set-parent").set(
+            "original", interval_seconds=60
+        )
+        stale = loops.LoopManager(session_id="stale-set-parent")
+        assert loops.migrate_loop_to_session(
+            "stale-set-parent", "stale-set-child"
+        )
+
+        with pytest.raises(loops.LoopPersistenceError, match="persist"):
+            stale.set("replacement", interval_seconds=60)
+
+        assert stale.state.status == "cleared"
+        assert loops.load_loop("stale-set-parent").status == "cleared"
+        assert loops.load_loop("stale-set-child").prompt == "original"
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            ("pause", None),
+            ("resume", None),
+            ("clear", False),
+            ("mark_done", False),
+        ],
+    )
+    def test_stale_control_does_not_report_success_or_overwrite(
+        self, hermes_home, operation, expected
+    ):
+        from hermes_cli import loops
+
+        parent = f"stale-{operation}-parent"
+        child = f"stale-{operation}-child"
+        loops.LoopManager(session_id=parent).set("original", interval_seconds=60)
+        stale = loops.LoopManager(session_id=parent)
+        assert loops.migrate_loop_to_session(parent, child)
+
+        if operation == "pause":
+            result = stale.pause()
+        elif operation == "resume":
+            result = stale.resume()
+        elif operation == "clear":
+            result = stale.clear()
+        else:
+            result = stale.mark_done("stale completion")
+
+        assert result is expected
+        assert stale.state.status == "cleared"
+        assert loops.load_loop(parent).status == "cleared"
+        assert loops.load_loop(child).status == "active"
+
+    @pytest.mark.parametrize("operation", ["release", "abandon"])
+    def test_stale_inflight_control_fails_closed(
+        self, hermes_home, operation
+    ):
+        from hermes_cli import loops
+
+        parent = f"stale-{operation}-parent"
+        child = f"stale-{operation}-child"
+        owner = loops.LoopManager(session_id=parent)
+        owner.set("original", interval_seconds=60)
+        assert owner.fire_tick() is not None
+        stale = loops.LoopManager(session_id=parent)
+        assert loops.migrate_loop_to_session(parent, child)
+
+        if operation == "release":
+            result = stale.release_stale_tick_claim(
+                now=stale.state.next_due_at + 1
+            )
+        else:
+            result = stale.abandon_tick()
+
+        assert result is False
+        assert stale.state.status == "cleared"
+        assert loops.load_loop(parent).status == "cleared"
+        assert loops.load_loop(child).awaiting_response is True
+
+    @pytest.mark.parametrize(
+        "branch",
+        ["marker", "until_done", "until_blocked", "times", "max_ticks", "continue"],
+    )
+    def test_every_stale_complete_tick_branch_fails_closed(
+        self, hermes_home, branch
+    ):
+        from hermes_cli import loops
+
+        parent = f"stale-complete-{branch}-parent"
+        child = f"stale-complete-{branch}-child"
+        until = "deploy healthy" if branch.startswith("until_") else ""
+        times = 1 if branch == "times" else 0
+        owner = loops.LoopManager(session_id=parent)
+        state = owner.set(
+            "original", interval_seconds=60, times=times, until=until
+        )
+        if branch == "max_ticks":
+            state.max_ticks = 1
+            loops.save_loop(parent, state)
+        assert owner.fire_tick() is not None
+        stale = loops.LoopManager(session_id=parent)
+        assert loops.migrate_loop_to_session(parent, child)
+
+        response = "done\nLOOP_COMPLETE" if branch == "marker" else "still running"
+        judge = (
+            ("done", "healthy", False, None, False)
+            if branch == "until_done"
+            else ("blocked", "impossible", False, None, False)
+        )
+        with patch("hermes_cli.goals.judge_goal", return_value=judge):
+            decision = stale.complete_tick(response)
+
+        assert decision["persisted"] is False
+        assert decision["status"] == "cleared"
+        assert decision["stopped"] is True
+        assert decision["message"] == ""
+        assert loops.load_loop(parent).status == "cleared"
+        assert loops.load_loop(child).status == "active"
 
 
 # ──────────────────────────────────────────────────────────────────────
