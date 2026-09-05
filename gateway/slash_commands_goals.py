@@ -405,6 +405,9 @@ class GatewayGoalCommandsMixin:
                     "scope_id", "guild_id", "parent_chat_id", "profile",
                 ):
                     route[key] = str(getattr(src, key, "") or "")
+                transport_owner = self._transport_owner(src)
+                if transport_owner is not None:
+                    route["adapter_profile"] = transport_owner[1] or "default"
                 route = {k: v for k, v in route.items() if v}
         except Exception:
             route = {}

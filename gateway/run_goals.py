@@ -355,7 +355,11 @@ class GatewayGoalsMixin:
         """Inject one due loop only from the profile store that owns it."""
         import weakref
 
-        from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
+        from hermes_cli.loops import (
+            LoopManager,
+            _MIGRATION_CHAIN_MAX_HOPS,
+            goal_blocks_loop_tick,
+        )
 
         if now < state.next_due_at:
             return
@@ -425,18 +429,28 @@ class GatewayGoalsMixin:
             if persisted_source is not None:
                 source = persisted_source
 
-        if profile_name is None:
-            adapters = self.adapters
-        else:
-            use_shared_adapters = False
-            with suppress(Exception):
-                use_shared_adapters = self._profile_name_for_source(source) == profile_name
-            adapters = (
-                self.adapters
-                if use_shared_adapters
-                else (getattr(self, "_profile_adapters", None) or {}).get(profile_name) or {}
-            )
-        adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
+        transport_owner = self._transport_owner(source)
+        adapter = transport_owner[0] if transport_owner is not None else None
+        if adapter is None:
+            adapter_profile = str(route.get("adapter_profile") or "").strip()
+            if adapter_profile:
+                adapters = (
+                    self.adapters
+                    if adapter_profile == "default"
+                    else (getattr(self, "_profile_adapters", None) or {}).get(adapter_profile) or {}
+                )
+            elif profile_name is None:
+                adapters = self.adapters
+            else:
+                use_shared_adapters = False
+                with suppress(Exception):
+                    use_shared_adapters = self._profile_name_for_source(source) == profile_name
+                adapters = (
+                    self.adapters
+                    if use_shared_adapters
+                    else (getattr(self, "_profile_adapters", None) or {}).get(profile_name) or {}
+                )
+            adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
         if adapter is None:
             if sid not in warned_no_route:
                 warned_no_route.add(sid)
@@ -486,6 +500,21 @@ class GatewayGoalsMixin:
         wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
         if not wakeup:
             return
+
+        def _settle_tick(method: str, *args):
+            current = mgr
+            visited = set()
+            for _hop in range(_MIGRATION_CHAIN_MAX_HOPS + 1):
+                if current.session_id in visited:
+                    break
+                visited.add(current.session_id)
+                result = getattr(current, method)(*args)
+                migrated_to = str(getattr(current.state, "migrated_to", "") or "").strip()
+                if not migrated_to:
+                    return result
+                current = LoopManager(session_id=migrated_to)
+            return result
+
         try:
             logger.info(
                 "loop wakeup #%s — injecting for %s chat=%s thread=%s",
@@ -494,11 +523,11 @@ class GatewayGoalsMixin:
             )
             await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
             if wakeup.lstrip().startswith("/"):
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
+                await self._run_in_executor_with_context(_settle_tick, "complete_tick", "")
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             with suppress(Exception):
-                await self._run_in_executor_with_context(mgr.abandon_tick)
+                await self._run_in_executor_with_context(_settle_tick, "abandon_tick")
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops

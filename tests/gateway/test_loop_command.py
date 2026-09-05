@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -645,6 +646,171 @@ async def test_loop_wakeup_watcher_uses_shared_adapter_for_matching_profile_rout
     assert runner._session_key_for_source(event.source) == session_key
     assert event.source._transport_adapter_ref() is shared_adapter
     assert runner._adapter_for_source(event.source) is shared_adapter
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_keeps_transport_owner_when_route_targets_another_profile(
+    loop_env, monkeypatch
+):
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    runtime_profile = "coder"
+    transport_profile = "alerts"
+    runtime_home = loop_env / "profiles" / runtime_profile
+    runtime_home.mkdir(parents=True)
+    (loop_env / "profiles" / transport_profile).mkdir(parents=True)
+    sessions_dir = loop_env / "gateway-sessions"
+    config = GatewayConfig(
+        sessions_dir=sessions_dir,
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[runtime_profile, transport_profile],
+        profile_routes=[
+            ProfileRoute(
+                name="coder-discord",
+                platform="discord",
+                profile=runtime_profile,
+                guild_id="guild-7",
+                chat_id="secondary-channel",
+            )
+        ],
+    )
+    primary_adapter = Mock()
+    primary_adapter.handle_message = AsyncMock()
+    primary_adapter._pending_messages = {}
+    primary_adapter._session_tasks = {}
+    secondary_adapter = Mock()
+    secondary_adapter.handle_message = AsyncMock()
+    secondary_adapter._pending_messages = {}
+    secondary_adapter._session_tasks = {}
+
+    runner = _make_runner()
+    runner.config = config
+    runner.session_store = SessionStore(sessions_dir, config)
+    runner.adapters = {Platform.DISCORD: primary_adapter}
+    runner._profile_adapters = {
+        runtime_profile: {},
+        transport_profile: {Platform.DISCORD: secondary_adapter},
+    }
+    runner._running_agents = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="secondary-channel",
+        chat_type="group",
+        user_id="secondary-user",
+        scope_id="guild-7",
+        profile=runtime_profile,
+    )
+    source._transport_adapter_ref = weakref.ref(secondary_adapter)
+    event = _make_event("/loop 5m /status")
+    event.source = source
+
+    with gateway_run._profile_runtime_scope(runtime_home):
+        await asyncio.to_thread(goals._get_session_db)
+        await GatewayRunner._handle_loop_command(runner, event)
+        session_entry = runner.session_store.get_or_create_session(source)
+        persisted = loops.load_loop(session_entry.session_id)
+        assert persisted.route["adapter_profile"] == transport_profile
+        persisted.next_due_at = time.time() - 1
+        loops.save_loop(session_entry.session_id, persisted)
+
+        # Legacy rows have no persisted transport owner. While the original
+        # source is still live, its adapter provenance remains authoritative.
+        legacy_scan_state = loops.LoopState.from_json(persisted.to_json())
+        legacy_scan_state.route.pop("adapter_profile")
+        await GatewayRunner._loop_wakeup_fire_one(
+            runner,
+            session_entry.session_id,
+            legacy_scan_state,
+            time.time(),
+            set(),
+            set(),
+            runtime_profile,
+        )
+
+    secondary_adapter.handle_message.assert_awaited_once()
+    primary_adapter.handle_message.assert_not_awaited()
+
+    # A restart drops the in-process weakref. The persisted owner profile must
+    # recover the same transport independently of the routed runtime profile.
+    runner.session_store.close_all_db_handles()
+    restarted = _make_runner()
+    restarted.config = config
+    restarted.session_store = SessionStore(sessions_dir, config)
+    restarted.adapters = {Platform.DISCORD: primary_adapter}
+    restarted._profile_adapters = runner._profile_adapters
+    restarted._running_agents = {}
+    with gateway_run._profile_runtime_scope(runtime_home):
+        await asyncio.to_thread(goals._get_session_db)
+        due = loops.load_loop(session_entry.session_id)
+        due.next_due_at = time.time() - 1
+        loops.save_loop(session_entry.session_id, due)
+        await GatewayRunner._loop_wakeup_fire_one(
+            restarted,
+            session_entry.session_id,
+            due,
+            time.time(),
+            set(),
+            set(),
+            runtime_profile,
+        )
+    restarted.session_store.close_all_db_handles()
+
+    assert secondary_adapter.handle_message.await_count == 2
+    primary_adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injection", ["complete", "abandon"])
+async def test_slash_loop_settlement_follows_session_rotation(loop_env, injection):
+    config = GatewayConfig(sessions_dir=loop_env / "gateway-sessions")
+    runner = _make_runner()
+    runner.config = config
+    runner.session_store = SessionStore(config.sessions_dir, config)
+    runner._running_agents = {}
+    source = _make_event("wakeup").source
+    session_entry = runner.session_store.get_or_create_session(source)
+    session_key = session_entry.session_key
+    successors = []
+
+    async def _rotate_during_slash_dispatch(_event):
+        successors.append(await runner.async_session_store.reset_session(session_key))
+        if injection == "abandon":
+            raise RuntimeError("slash dispatch failed after rotation")
+
+    adapter = Mock()
+    adapter.handle_message = AsyncMock(side_effect=_rotate_during_slash_dispatch)
+    adapter._pending_messages = {}
+    adapter._session_tasks = {}
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    manager = loops.LoopManager(session_id=session_entry.session_id)
+    state = manager.set(
+        "/new",
+        interval_seconds=300,
+        route={
+            "platform": "discord",
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+            "thread_id": source.thread_id,
+            "user_id": source.user_id,
+        },
+    )
+    state.next_due_at = time.time() - 1
+    loops.save_loop(session_entry.session_id, state)
+
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, session_entry.session_id, state, time.time(), set()
+    )
+
+    successor = successors[0]
+    old_state = loops.load_loop(session_entry.session_id)
+    successor_state = loops.load_loop(successor.session_id)
+    assert old_state.migrated_to == successor.session_id
+    assert successor_state.awaiting_response is False
+    assert successor_state.ticks_fired == (1 if injection == "complete" else 0)
 
 
 @pytest.mark.asyncio
