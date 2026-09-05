@@ -7,6 +7,7 @@ import logging
 import os
 import json
 import threading
+import weakref
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
@@ -760,8 +761,11 @@ class SessionStore(
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # get-or-create single-flight does not cover reset_session(). Hold a
-        # per-route lock until successor creation and loop migration finish.
-        self._rotation_locks: Dict[str, Any] = {}
+        # per-route lock until successor creation and loop migration finish. Callers
+        # strongly hold active locks; weak values discard idle routing keys.
+        self._rotation_locks: weakref.WeakValueDictionary[str, Any] = (
+            weakref.WeakValueDictionary()
+        )
         # An unscoped legacy Slack key is claimed once per process (two workspaces must not both
         # revive one session).
         self._legacy_slack_claim_lock = threading.Lock()
@@ -885,7 +889,7 @@ class SessionStore(
                 self._inflight_sessions.pop(session_key, None)
 
     def _rotation_lock_for_key(self, session_key: str):
-        """Return the lock linearizing successor publication for one route."""
+        """Return the shared live lock linearizing successor publication for one route."""
         registry_lock = getattr(self, "_inflight_lock", None)
         if registry_lock is None:
             registry_lock = threading.Lock()
@@ -894,7 +898,7 @@ class SessionStore(
         with registry_lock:
             rotation_locks = getattr(self, "_rotation_locks", None)
             if rotation_locks is None:
-                rotation_locks = self._rotation_locks = {}
+                rotation_locks = self._rotation_locks = weakref.WeakValueDictionary()
             lock = rotation_locks.get(session_key)
             if lock is None:
                 lock = rotation_locks[session_key] = threading.RLock()

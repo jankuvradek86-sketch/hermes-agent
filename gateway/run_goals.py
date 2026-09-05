@@ -376,13 +376,17 @@ class GatewayGoalsMixin:
         row_profile = route_profile
         if multiplex and not row_profile:
             # Legacy loop rows predate route.profile. Ownership must be proven
-            # by the session row in this same profile store.
-            def _session_owner_profile() -> str:
+            # by the session row in this same profile store. A present row with
+            # NULL profile belongs to the scan's active profile; no row remains
+            # unowned and must still fail closed.
+            def _session_owner_profile() -> str | None:
                 from hermes_cli.goals import _get_session_db
 
                 session_db = _get_session_db()
                 session = session_db.get_session(sid) if session_db is not None else None
-                return str((session or {}).get("profile_name") or "").strip()
+                if session is None:
+                    return None
+                return str(session.get("profile_name") or "").strip() or scan_profile
 
             row_profile = await self._run_in_executor_with_context(_session_owner_profile)
         if multiplex and row_profile != scan_profile:

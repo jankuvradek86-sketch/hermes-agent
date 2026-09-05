@@ -481,6 +481,75 @@ async def test_loop_wakeup_watcher_ignores_foreign_profile_row_in_launch_db(
 
 
 @pytest.mark.asyncio
+async def test_loop_wakeup_accepts_unprofiled_session_owned_by_default_scan(
+    loop_env, monkeypatch
+):
+    """A real local session with NULL profile ownership belongs to the active scan."""
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: None
+    )
+    session_id = "default-unprofiled-loop"
+    session_db = await asyncio.to_thread(goals._get_session_db)
+    await asyncio.to_thread(
+        session_db.create_session,
+        session_id=session_id,
+        source="discord",
+        profile_name=None,
+    )
+    await asyncio.to_thread(
+        session_db._write_sql,
+        "UPDATE sessions SET profile_name = NULL WHERE id = ?",
+        (session_id,),
+    )
+    session_row = await asyncio.to_thread(session_db.get_session, session_id)
+    assert session_row["profile_name"] is None
+    manager = loops.LoopManager(session_id=session_id)
+    state = manager.set(
+        "continue default work",
+        interval_seconds=300,
+        route={
+            "platform": "discord",
+            "chat_id": "default-channel",
+            "chat_type": "channel",
+            "user_id": "default-user",
+        },
+    )
+    state.next_due_at = time.time() - 1
+    loops.save_loop(session_id, state)
+
+    default_adapter = Mock()
+    default_adapter.handle_message = AsyncMock()
+    default_adapter._pending_messages = {}
+    default_adapter._session_tasks = {}
+    runner = _make_runner()
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.session_store = None
+    runner.adapters = {Platform.DISCORD: default_adapter}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner,
+        session_id,
+        state,
+        time.time(),
+        set(),
+        set(),
+        None,
+    )
+
+    default_adapter.handle_message.assert_awaited_once()
+    event = default_adapter.handle_message.await_args.args[0]
+    assert event.source.profile is None
+    assert loops.load_loop(session_id).awaiting_response is True
+
+
+@pytest.mark.asyncio
 async def test_loop_wakeup_watcher_uses_named_launch_profile_as_scan_owner(
     loop_env, monkeypatch
 ):
@@ -500,7 +569,18 @@ async def test_loop_wakeup_watcher_uses_named_launch_profile_as_scan_owner(
     session_id = "session-launch-profile-loop"
     token = set_hermes_home_override(profile_home)
     try:
-        await asyncio.to_thread(goals._get_session_db)
+        session_db = await asyncio.to_thread(goals._get_session_db)
+        await asyncio.to_thread(
+            session_db.create_session,
+            session_id=session_id,
+            source="discord",
+            profile_name=None,
+        )
+        await asyncio.to_thread(
+            session_db._write_sql,
+            "UPDATE sessions SET profile_name = NULL WHERE id = ?",
+            (session_id,),
+        )
         manager = loops.LoopManager(session_id)
         state = manager.set(
             "continue launch work",
@@ -510,7 +590,6 @@ async def test_loop_wakeup_watcher_uses_named_launch_profile_as_scan_owner(
                 "chat_id": "launch-channel",
                 "chat_type": "channel",
                 "user_id": "launch-user",
-                "profile": profile_name,
             },
         )
         state.next_due_at = time.time() - 1

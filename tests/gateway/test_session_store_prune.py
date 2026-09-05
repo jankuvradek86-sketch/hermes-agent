@@ -14,8 +14,10 @@ tests pin the prune behaviour:
     (so a long-running-but-still-active session isn't pruned)
 """
 
+import gc
 import json
 import threading
+import weakref
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -183,6 +185,55 @@ class TestPruneBasics:
             if i % 2 == 1:  # fresh
                 assert f"s{i}" in store._entries
 
+    def test_prune_reclaims_route_locks_without_splitting_live_same_key_lock(
+        self, tmp_path
+    ):
+        store = _make_store(tmp_path)
+        lock_refs = []
+        route_count = 256
+        for index in range(route_count):
+            key = f"stale-{index}"
+            store._entries[key] = _entry(key, age_days=1000)
+            lock = store._rotation_lock_for_key(key)
+            lock_refs.append(weakref.ref(lock))
+
+        removed = store.prune_old_entries(max_age_days=90)
+        del lock
+        gc.collect()
+        idle_locks_reclaimed = all(ref() is None for ref in lock_refs)
+
+        shared = store._rotation_lock_for_key("shared-route")
+        shared_ref = weakref.ref(shared)
+        shared.acquire()
+        identities = []
+        overlapping_acquires = []
+
+        def _try_same_key():
+            candidate = store._rotation_lock_for_key("shared-route")
+            identities.append(candidate is shared)
+            acquired = candidate.acquire(blocking=False)
+            overlapping_acquires.append(acquired)
+            if acquired:
+                candidate.release()
+
+        threads = [threading.Thread(target=_try_same_key) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        shared.release()
+
+        assert removed == route_count
+        assert idle_locks_reclaimed is True
+        assert identities == [True] * len(threads)
+        assert overlapping_acquires == [False] * len(threads)
+
+        del shared
+        gc.collect()
+        assert shared_ref() is None
+        assert len(store._rotation_locks) == 0
+
 
 class TestPrunePersistsToDisk:
     def test_prune_rewrites_sessions_json(self, tmp_path):
@@ -258,4 +309,3 @@ class TestReadmeSentinel:
         # The note points users at the real store and command.
         assert "state.db" in raw["_README"]
         assert "hermes sessions list" in raw["_README"]
-
