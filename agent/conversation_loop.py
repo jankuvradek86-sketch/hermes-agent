@@ -1416,6 +1416,13 @@ def run_conversation(
     # in-place boundary would make a later uncompressed result look compacted.
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # Capture identities before build_turn_context can replace history during
+    # preflight compression. Reset with each turn, never retain a text blacklist.
+    from agent.codex_runtime import codex_message_item_ids
+    agent._codex_commentary_item_ids = codex_message_item_ids(
+        item for message in (conversation_history or []) if isinstance(message, dict)
+        for item in (message.get("codex_message_items") or [])
+    )
     begin_fast_mode_turn(agent, conversation_history)
 
     # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a

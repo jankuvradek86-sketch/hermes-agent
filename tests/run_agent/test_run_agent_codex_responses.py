@@ -13,6 +13,98 @@ import run_agent
 from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
 
 
+@pytest.mark.parametrize("compact", [False, True], ids=["request-history", "precompaction-history"])
+def test_codex_historical_commentary_ids_never_reach_delivery(monkeypatch, caplog, compact):
+    agent = _build_agent(monkeypatch)
+    caplog.set_level("DEBUG", logger="run_agent")
+    delivered, assembled, requests, compressions = [], [], [], []
+    agent.interim_assistant_callback = lambda text, **kw: delivered.append(text)
+
+    def item(item_id, text, phase="commentary"):
+        return {"type": "message", "role": "assistant", "id": item_id,
+                "phase": phase, "status": "completed",
+                "content": [{"type": "output_text", "text": text}]}
+
+    historical = [item(f"msg_old_{i}", f"Prior progress {i}") for i in range(7)]
+    history = []
+    for old in historical:
+        history.extend([{"role": "user", "content": "Earlier task"},
+                        {"role": "assistant", "content": "", "codex_message_items": [old]}])
+    if compact:
+        history[0]["content"] = "old context " * 10000
+        agent.context_compressor.context_length = 20000
+        agent.context_compressor.threshold_tokens = 20000
+
+        def compress(messages, system_message, **kwargs):
+            compressions.append(True)
+            assert delivered == []
+            # Retain one old item; the other six are available only before compaction.
+            agent._last_compaction_in_place = True
+            return [{"role": "user", "content": "Summary"}, history[-1],
+                    messages[-1]], system_message
+
+        monkeypatch.setattr(agent, "_compress_context", compress)
+    new = item("msg_new", "Prior progress 0")  # Same text, genuinely new identity.
+    final_item = item("msg_final", "Finished.", "final_answer")
+    output = [SimpleNamespace(**{**value, "content": [SimpleNamespace(**part) for part in value["content"]]})
+              for value in historical + [new, final_item]]
+
+    def create(**kwargs):
+        requests.append(kwargs.get("extra_body", {}).get("input", kwargs.get("input")))
+        return _FakeCreateStream([
+            {"type": "response.output_item.done", "item": value, "output_index": index}
+            for index, value in enumerate(output)
+        ] + [{"type": "response.completed", "response": {"status": "completed"}}])
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+    def request(api_kwargs):
+        response = agent._run_codex_stream(api_kwargs, client=client)
+        assembled.append(response)
+        return response
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", request)
+    result = agent.run_conversation("Continue", conversation_history=history)
+    assert bool(compressions) == compact
+    request_ids = {value.get("id") for value in requests[0]}
+    assert "msg_old_6" in request_ids
+    assert ("msg_old_0" in request_ids) is not compact
+    assert delivered == ["Prior progress 0"]
+    decisions = [record.getMessage() for record in caplog.records
+                 if record.name == "run_agent" and record.getMessage().startswith("Codex commentary callback:")]
+    assert decisions.count("Codex commentary callback: item_id_present=True suppressed=True") == 7
+    assert decisions.count("Codex commentary callback: item_id_present=True suppressed=False") == 1
+    assert assembled[0].output == output
+    assert result["completed"] and result["final_response"] == "Finished."
+    from agent.codex_responses_adapter import _normalize_codex_response
+    normalized, reason = _normalize_codex_response(assembled[0])
+    agent._emit_interim_assistant_message(agent._build_assistant_message(normalized, reason))
+    assert delivered == ["Prior progress 0"]
+
+
+def test_codex_new_commentary_id_preserves_same_text_delivery(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    attempts = []
+
+    def deliver(text, **kwargs):
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary callback failure")
+        delivered.append(text)
+
+    agent.interim_assistant_callback = deliver
+    output = [{"type": "message", "id": item_id, "role": "assistant", "phase": "commentary",
+               "content": [{"type": "output_text", "text": "Checking."}]}
+              for item_id in ("msg_new_a", "msg_new_a", "msg_new_b", "msg_new_b")]
+    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kw: _FakeCreateStream([
+        {"type": "response.output_item.done", "item": value} for value in output
+    ] + [{"type": "response.completed", "response": {"status": "completed"}}])))
+    response = agent._run_codex_stream(_codex_request_kwargs(), client=client)
+    assert delivered == ["Checking.", "Checking."]
+    assert response.output == output
+
+
 @pytest.fixture(autouse=True)
 def _no_codex_backoff(monkeypatch):
     """Short-circuit retry backoff so Codex retry tests don't block on real

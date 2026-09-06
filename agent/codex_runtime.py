@@ -507,6 +507,15 @@ def _event_field(event: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+def codex_message_item_ids(items: Any) -> set[str]:
+    """Known assistant identities only; never infer replay from message text."""
+    return {
+        item["id"] for item in items
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant"
+        and isinstance(item.get("id"), str) and item["id"]
+    }
+
+
 def _raise_stream_error(event: Any) -> None:
     """Raise ``_StreamErrorEvent`` from a ``type=error`` SSE frame. The spec puts code/message/param at the
     top level, but the SDK and several proxies nest them under ``error``; read top-level first, then the envelope."""
@@ -552,9 +561,11 @@ class _CodexResponseAssembler:
     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
     saw_response_completed = False
 
-    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta):
+    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta,
+                 on_commentary_item=None):
         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
         self.on_commentary_message, self.on_first_delta = on_commentary_message, on_first_delta
+        self.on_commentary_item = on_commentary_item
         self.output_items: List[Any] = []
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
         # back in stream order.
@@ -598,7 +609,7 @@ class _CodexResponseAssembler:
         if self.active_message_phase == "commentary":
             self.commentary_text_deltas.append(delta_text)
             # Legacy fallback when no first-class commentary consumer is installed.
-            if self.on_commentary_message is None:
+            if self.on_commentary_message is None and self.on_commentary_item is None:
                 self._safe(self.on_reasoning_delta, "on_reasoning_delta", delta_text)
         elif self.active_message_phase == "analysis":
             self._safe(self.on_reasoning_delta, "on_reasoning_delta", delta_text)
@@ -650,10 +661,13 @@ class _CodexResponseAssembler:
         self.output_sequences.append(announced_sequence)
         # Confirmed by the authoritative done event; never settle it twice.
         self.pending_function_calls.pop(done_id, None)
-        if _message_phase(done_item) == "commentary" and self.on_commentary_message is not None:
+        if _message_phase(done_item) == "commentary" and (self.on_commentary_message is not None or self.on_commentary_item is not None):
             commentary_text = "".join(self.commentary_text_deltas).strip() or _output_text_of(done_item)
             if commentary_text:
-                self._safe(self.on_commentary_message, "on_commentary_message", commentary_text)
+                if self.on_commentary_item is not None:
+                    self._safe(self.on_commentary_item, "on_commentary_item", commentary_text, done_item)
+                else:
+                    self._safe(self.on_commentary_message, "on_commentary_message", commentary_text)
             self.commentary_text_deltas = []
 
     def _on_terminal(self, event: Any, event_type: str) -> bool:
@@ -732,7 +746,7 @@ class _CodexResponseAssembler:
 
 def _consume_codex_event_stream(
     event_iter: Any, *, model: str, on_text_delta=None, on_reasoning_delta=None, on_commentary_message=None,
-    on_first_delta=None, on_event=None, interrupt_check=None,
+    on_first_delta=None, on_event=None, interrupt_check=None, on_commentary_item=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -740,12 +754,14 @@ def _consume_codex_event_stream(
 
     Callbacks: ``on_text_delta`` per output_text delta, suppressed once a function_call is seen;
     ``on_reasoning_delta`` for reasoning and ``phase=analysis`` deltas (also commentary without a commentary
-    callback); ``on_commentary_message`` once per completed ``phase=commentary`` message, before any following
+    callback); ``on_commentary_item(text, item)`` takes precedence over the legacy text-only
+    ``on_commentary_message`` once per completed ``phase=commentary`` message, before any following
     tool item; ``on_first_delta`` one-shot; ``on_event`` every event before any processing; ``interrupt_check()``
     True breaks the loop and may raise ``TimeoutError`` / ``InterruptedError`` for request retirement that
     must not become a partial final response."""
     assembler = _CodexResponseAssembler(model=model, on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
-                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta)
+                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
+                                        on_commentary_item=on_commentary_item)
     for event in event_iter:
         if on_event is not None:
             try:
@@ -860,6 +876,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+        # Read the effective request, including middleware overrides, before SDK
+        # transformation. Turn-start identities also survive preflight compaction.
+        extra_body = stream_kwargs.get("extra_body") or {}
+        input_items = extra_body.get("input", stream_kwargs.get("input", []))
+        known_ids = getattr(agent, "_codex_commentary_item_ids", set())
+        if isinstance(input_items, list):
+            agent._codex_commentary_item_ids = known_ids | codex_message_item_ids(input_items)
         stream_kwargs["stream"] = True
         return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
 
@@ -907,7 +930,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 agent._abort_request_openai_client(active_client, reason="codex_stream_close_failed")
     show_commentary = getattr(agent, "show_commentary", True)
     wants_commentary = getattr(agent, "interim_assistant_callback", None) is not None and show_commentary
-    on_commentary_message = _fenced(lambda text: agent._fire_streamed_codex_commentary(text)) if wants_commentary else None
+    def _on_commentary_item(text: str, item: Any) -> None:
+        if _request_is_current():
+            item_id = _event_field(item, "id")
+            if isinstance(item_id, str) and item_id:
+                agent._fire_streamed_codex_commentary(text, item_id=item_id)
+            else:
+                agent._fire_streamed_codex_commentary(text)
     call_role = ("delegated" if getattr(agent, "is_subagent", False)
                  else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
     for attempt in range(max_stream_retries + 1):
@@ -932,7 +961,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 final = _consume_codex_event_stream(
                     event_stream, model=model, on_text_delta=_fenced(_on_text_delta),
                     on_reasoning_delta=_fenced(lambda text: agent._fire_reasoning_delta(text)),
-                    on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
+                    on_commentary_item=_on_commentary_item if wants_commentary else None, on_first_delta=on_first_delta,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:

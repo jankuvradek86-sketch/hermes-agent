@@ -160,26 +160,36 @@ class StreamDeliveryMixin:
                 self._delivered_interim_texts = set()
             self._delivered_interim_texts.add(normalized)
 
-    def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
+    def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> bool:
         """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
-            return
+            return False
         try:
             cb(visible, already_streamed=already_streamed)
             for part in record:
                 self._record_delivered_interim_text(part)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
-    def _fire_streamed_codex_commentary(self, text: str) -> None:
+    def _fire_streamed_codex_commentary(self, text: str, *, item_id: str | None = None) -> None:
         """Deliver a completed live Codex commentary message immediately."""
         if getattr(self, "interim_assistant_callback", None) is None or not isinstance(text, str):
             return
-        visible = self._visible_commentary(text)
-        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
+        known_ids = getattr(self, "_codex_commentary_item_ids", set())
+        suppressed = bool(item_id and item_id in known_ids)
+        logger.debug("Codex commentary callback: item_id_present=%s suppressed=%s", bool(item_id), suppressed)
+        if suppressed:
             return
-        self._deliver_interim(visible, already_streamed=False, record=[visible])
+        visible = self._visible_commentary(text)
+        if not visible or visible == "(empty)" or (not item_id and self._interim_text_was_delivered(visible)):
+            return
+        delivered = self._deliver_interim(visible, already_streamed=False, record=[visible])
+        if delivered and item_id:
+            known_ids.add(item_id)
+            self._codex_commentary_item_ids = known_ids
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer. Does NOT set
@@ -188,6 +198,17 @@ class StreamDeliveryMixin:
         if not isinstance(assistant_msg, dict):
             return
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        if commentary_parts:
+            # The assembled response retains historical items for persistence. The
+            # fallback must honor the same identity boundary as live callbacks.
+            known_ids = getattr(self, "_codex_commentary_item_ids", set())
+            assistant_msg = {**assistant_msg, "codex_message_items": [
+                item for item in assistant_msg["codex_message_items"]
+                if not isinstance(item, dict) or item.get("id") not in known_ids
+            ]}
+            commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+            if not commentary_parts:
+                return
         # Dedup within this message and against earlier deliveries, first occurrence wins.
         pending: dict[str, str] = {}
         for part in commentary_parts:
