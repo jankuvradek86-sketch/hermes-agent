@@ -1,9 +1,10 @@
 """Profile-based routing: route guilds/channels/threads to different profiles.
 
 Matching priority, most specific first (``gateway.profile_routes`` in config.yaml):
-platform + chat_id + thread_id (14) → platform + chat_id (6) → platform + guild_id (2)
-→ default profile. For Discord threads/forum posts ``parent_chat_id`` carries the
-direct parent, so a channel route also matches any thread/post under it.
+explicit thread_id → direct chat_id → inherited parent chat_id → guild → platform
+→ default profile. Declared discriminator specificity breaks ties within a scope.
+For Discord threads/forum posts ``parent_chat_id`` carries the direct parent,
+so a channel route remains a fallback for threads/posts without a direct route.
 """
 
 from __future__ import annotations
@@ -149,8 +150,20 @@ def match_profile_route(
     routes: List[ProfileRoute], platform: str, guild_id: Optional[str] = None, chat_id: Optional[str] = None,
     thread_id: Optional[str] = None, parent_chat_id: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
-    """Return the first (most specific) matching route, or None."""
+    """Prefer explicit threads, direct chats, then inherited parent routes.
+
+    Declared specificity breaks ties within a scope; equal matches retain input
+    order. Parent inheritance must not shadow a route for the actual thread chat.
+    """
+    best = None
+    best_priority = (-1, False, -1)
     for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
-            return route
-    return None
+        if not route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+            continue
+        direct_chat = bool(route.chat_id) and route.matches(
+            platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id,
+        )
+        priority = (bool(route.thread_id), direct_chat, route.specificity)
+        if priority > best_priority:
+            best, best_priority = route, priority
+    return best

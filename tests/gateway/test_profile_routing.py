@@ -109,6 +109,44 @@ class TestSessionKeyIntegration:
 class TestParentChatIdMatching:
     """Thread messages carry thread_id as chat_id; parent_chat_id is the channel."""
 
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize("thread_guild", [None, "1494074971713175713"])
+    def test_direct_thread_chat_beats_parent_route(self, reverse, thread_guild):
+        raw = [
+            dict(name="parent", platform="discord", profile="jaros-app",
+                 guild_id="1494074971713175713", chat_id="1525579871475204322"),
+            dict(name="inbox", platform="discord", profile="jaros-prijem",
+                 guild_id=thread_guild, chat_id="1544256027027968093"),
+        ]
+        routes = parse_profile_routes(raw[::-1] if reverse else raw)
+        inbox = next(r for r in routes if r.name == "inbox")
+        parent = next(r for r in routes if r.name == "parent")
+        args = dict(platform="discord", guild_id="1494074971713175713",
+                    chat_id="1544256027027968093")
+        assert match_profile_route(routes, **args, thread_id=None) == inbox
+        assert match_profile_route(
+            routes, **args, thread_id=None, parent_chat_id="1525579871475204322",
+        ) == inbox
+        # Unconfigured sibling threads still inherit the channel route.
+        args["chat_id"] = "sibling-thread"
+        assert match_profile_route(
+            routes, **args, parent_chat_id="1525579871475204322",
+        ) == parent
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_explicit_thread_beats_direct_chat_and_parent(self, reverse):
+        routes = parse_profile_routes([
+            dict(name="parent", platform="discord", profile="parent", chat_id="channel"),
+            dict(name="chat", platform="discord", profile="chat", chat_id="post"),
+            dict(name="thread", platform="discord", profile="thread",
+                 chat_id="channel", thread_id="post"),
+        ])
+        if reverse:
+            routes.reverse()
+        assert match_profile_route(
+            routes, "discord", chat_id="post", thread_id="post", parent_chat_id="channel",
+        ) == next(r for r in routes if r.name == "thread")
+
     def test_channel_route_matches_via_parent_chat_id(self):
         r = ProfileRoute(name="ch", platform="discord", profile="trader",
                          chat_id="222")
