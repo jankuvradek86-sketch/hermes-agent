@@ -12,8 +12,8 @@ import pytest
 
 from gateway import run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
-from gateway.profile_routing import ProfileRoute
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.profile_routing import ProfileRoute, match_profile_route
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
 from hermes_constants import get_hermes_home
@@ -58,6 +58,9 @@ def _make_runner():
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
+    # Match construction: the launch identity stays fixed inside secondary scopes.
+    from hermes_cli.profiles import get_active_profile_name
+    runner._primary_profile_name = get_active_profile_name() or "default"
     runner.adapters = {}
     runner._queued_events = {}
     return runner
@@ -76,6 +79,55 @@ def _make_event(text: str) -> MessageEvent:
         ),
         message_id="msg-loop",
     )
+
+
+@pytest.mark.parametrize("adapter_profile", [None, "alerts"])
+def test_loop_routes_prefer_direct_chat_within_receiving_bot(adapter_profile):
+    routes = [
+        ProfileRoute(
+            name="foreign", platform="discord", profile="foreign",
+            chat_id="post", thread_id="post",
+            bot_profile="other-bot",
+        ),
+        ProfileRoute(
+            name="parent", platform="discord", profile="parent",
+            chat_id="channel", guild_id="guild", bot_profile=adapter_profile,
+        ),
+        ProfileRoute(
+            name="post", platform="discord", profile="coder",
+            chat_id="post", bot_profile=adapter_profile,
+        ),
+    ]
+    matched = match_profile_route(
+        routes, "discord", chat_id="post", thread_id="post",
+        parent_chat_id="channel", guild_id="guild", adapter_profile=adapter_profile,
+    )
+    assert matched is routes[2]
+
+
+@pytest.mark.parametrize(
+    "session_key, expected_profile",
+    [
+        ("", "coder"),
+        ("agent:alerts:discord:channel:post", "alerts"),
+        ("agent:main:discord:channel:post", None),
+        ("agent:main~:discord:channel:post", "main"),
+    ],
+)
+def test_loop_source_preserves_scope_and_canonical_profile(session_key, expected_profile):
+    runner = _make_runner()
+    source = runner._build_process_event_source({
+        "session_key": session_key,
+        "platform": "discord",
+        "chat_type": "channel",
+        "chat_id": "post",
+        "guild_id": "guild",
+        "parent_chat_id": "channel",
+        "profile": "coder",
+    })
+    assert source.profile == expected_profile
+    assert source.scope_id == source.guild_id == "guild"
+    assert source.parent_chat_id == "channel"
 
 
 @pytest.mark.asyncio
@@ -282,7 +334,6 @@ async def test_post_turn_loop_completion_persists_in_multiplex_profile(
 
     runner = _make_runner()
     runner.config.multiplex_profiles = True
-    runner.config.multiplex_profile_allowlist = [profile_name]
     source = _make_event("wakeup").source
     source.profile = profile_name
 
@@ -352,7 +403,6 @@ async def test_loop_wakeup_watcher_scopes_secondary_profile_and_adapter(
     runner = _make_runner()
     runner.config = GatewayConfig(
         multiplex_profiles=True,
-        multiplex_profile_allowlist=[profile_name],
     )
     runner.session_store = None
     runner.adapters = {Platform.DISCORD: default_adapter}
@@ -449,7 +499,6 @@ async def test_loop_wakeup_watcher_ignores_foreign_profile_row_in_launch_db(
     runner = _make_runner()
     runner.config = GatewayConfig(
         multiplex_profiles=True,
-        multiplex_profile_allowlist=[profile_name],
     )
     runner.session_store = None
     runner.adapters = {Platform.DISCORD: shared_adapter}
@@ -600,7 +649,6 @@ async def test_loop_wakeup_watcher_uses_named_launch_profile_as_scan_owner(
         runner = _make_runner()
         runner.config = GatewayConfig(
             multiplex_profiles=True,
-            multiplex_profile_allowlist=[],
         )
         runner.session_store = None
         runner.adapters = {Platform.DISCORD: shared_adapter}
@@ -646,7 +694,6 @@ async def test_loop_wakeup_watcher_uses_shared_adapter_for_matching_profile_rout
     config = GatewayConfig(
         sessions_dir=sessions_dir,
         multiplex_profiles=True,
-        multiplex_profile_allowlist=[profile_name],
         profile_routes=[
             ProfileRoute(
                 name="coder-discord",
@@ -695,7 +742,7 @@ async def test_loop_wakeup_watcher_uses_shared_adapter_for_matching_profile_rout
     runner.config = config
     runner.session_store = SessionStore(sessions_dir, config)
     runner.adapters = {Platform.DISCORD: shared_adapter}
-    runner._profile_adapters = {}
+    runner._profile_adapters = {profile_name: {}}
     runner._running_agents = {}
     runner._running = True
     runner._warm_goals_session_db = AsyncMock()
@@ -745,12 +792,12 @@ async def test_loop_wakeup_keeps_transport_owner_when_route_targets_another_prof
     config = GatewayConfig(
         sessions_dir=sessions_dir,
         multiplex_profiles=True,
-        multiplex_profile_allowlist=[runtime_profile, transport_profile],
         profile_routes=[
             ProfileRoute(
                 name="coder-discord",
                 platform="discord",
                 profile=runtime_profile,
+                bot_profile=transport_profile,
                 guild_id="guild-7",
                 chat_id="secondary-channel",
             )
@@ -843,7 +890,14 @@ async def test_loop_wakeup_keeps_transport_owner_when_route_targets_another_prof
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("injection", ["complete", "abandon"])
-async def test_slash_loop_settlement_follows_session_rotation(loop_env, injection):
+async def test_slash_loop_settlement_follows_session_rotation(loop_env, monkeypatch, injection):
+    import hermes_state
+
+    # Loops acquire HERMES_HOME/state.db explicitly; the session store must use
+    # that same profile DB instead of conftest's separately pinned default path.
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
+    )
     config = GatewayConfig(sessions_dir=loop_env / "gateway-sessions")
     runner = _make_runner()
     runner.config = config
@@ -853,9 +907,11 @@ async def test_slash_loop_settlement_follows_session_rotation(loop_env, injectio
     session_entry = runner.session_store.get_or_create_session(source)
     session_key = session_entry.session_key
     successors = []
+    successor_claims = []
 
     async def _rotate_during_slash_dispatch(_event):
         successors.append(await runner.async_session_store.reset_session(session_key))
+        successor_claims.append(loops.load_loop(successors[-1].session_id).awaiting_response)
         if injection == "abandon":
             raise RuntimeError("slash dispatch failed after rotation")
 
@@ -887,6 +943,7 @@ async def test_slash_loop_settlement_follows_session_rotation(loop_env, injectio
     successor = successors[0]
     old_state = loops.load_loop(session_entry.session_id)
     successor_state = loops.load_loop(successor.session_id)
+    assert successor_claims == [True]
     assert old_state.migrated_to == successor.session_id
     assert successor_state.awaiting_response is False
     assert successor_state.ticks_fired == (1 if injection == "complete" else 0)
@@ -909,7 +966,6 @@ async def test_loop_wakeup_watcher_reclaims_due_idle_awaiting_tick(
     config = GatewayConfig(
         sessions_dir=sessions_dir,
         multiplex_profiles=True,
-        multiplex_profile_allowlist=[profile_name],
         profile_routes=[
             ProfileRoute(
                 name="coder-discord",
@@ -959,7 +1015,7 @@ async def test_loop_wakeup_watcher_reclaims_due_idle_awaiting_tick(
     runner.config = config
     runner.session_store = SessionStore(sessions_dir, config)
     runner.adapters = {Platform.DISCORD: shared_adapter}
-    runner._profile_adapters = {}
+    runner._profile_adapters = {profile_name: {}}
     runner._running_agents = {}
     runner._running = True
     runner._warm_goals_session_db = AsyncMock()

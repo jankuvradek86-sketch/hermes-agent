@@ -506,7 +506,8 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
     )
 
 
-def test_build_slash_event_preserves_profile_route_coordinates(adapter):
+@pytest.mark.parametrize("owner_profile", [None, "alerts"])
+def test_build_slash_event_preserves_profile_route_coordinates(adapter, owner_profile):
     """Slash events must carry the same route coordinates as normal messages."""
     channel = _FakeTextChannel(channel_id=123, guild_name="TestGuild")
     interaction = SimpleNamespace(
@@ -516,12 +517,14 @@ def test_build_slash_event_preserves_profile_route_coordinates(adapter):
         user=SimpleNamespace(id=42, display_name="Jezza"),
     )
 
-    def resolve_profile(source):
+    def resolve_profile(source, *, adapter_profile):
+        assert adapter_profile == owner_profile
         assert source.guild_id == "456"
         assert source.chat_id == "123"
         assert source.parent_chat_id is None
         return "jaros-app"
 
+    adapter._owner_profile = owner_profile
     adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=resolve_profile)
     event = adapter._build_slash_event(interaction, "/reset")
 
@@ -530,7 +533,8 @@ def test_build_slash_event_preserves_profile_route_coordinates(adapter):
     assert event.source.profile == "jaros-app"
 
 
-def test_build_thread_slash_event_preserves_parent_route_coordinate(adapter):
+@pytest.mark.parametrize("owner_profile", [None, "alerts"])
+def test_build_thread_slash_event_preserves_parent_route_coordinate(adapter, owner_profile):
     """Thread slash events must retain the parent channel used by profile routes."""
     channel = _FakeThreadChannel(channel_id=200, parent_id=100)
     interaction = SimpleNamespace(
@@ -540,12 +544,14 @@ def test_build_thread_slash_event_preserves_parent_route_coordinate(adapter):
         user=SimpleNamespace(id=42, display_name="Jezza"),
     )
 
-    def resolve_profile(source):
+    def resolve_profile(source, *, adapter_profile):
+        assert adapter_profile == owner_profile
         assert source.guild_id == "456"
         assert source.thread_id == "200"
         assert source.parent_chat_id == "100"
         return "jaros-app"
 
+    adapter._owner_profile = owner_profile
     adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=resolve_profile)
     event = adapter._build_slash_event(interaction, "/reset")
 

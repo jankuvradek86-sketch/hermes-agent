@@ -10,10 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from contextlib import nullcontext, suppress
+from typing import TYPE_CHECKING, Any, Optional
 
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -103,9 +103,7 @@ class GatewayGoalsMixin:
         return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
-        """Track a session with an active heartbeat (``quick_key`` → ``(source, session_id)``) and
-        start the poller. In-memory by design: heartbeat STATE survives restarts in SessionDB, but
-        firing resumes only when the user touches /heartbeat again."""
+        """Track the canonical route and start the restart-recoverable poller."""
         watch = getattr(self, "_heartbeat_watch", None)
         if watch is None:
             watch = self._heartbeat_watch = {}
@@ -116,25 +114,57 @@ class GatewayGoalsMixin:
         (getattr(self, "_heartbeat_watch", None) or {}).pop(quick_key, None)
 
     async def _heartbeat_poll_once(self, watch: dict) -> None:
-        """One heartbeat poll pass: enqueue every due prompt of a non-busy watched session."""
-        # Off-loop warm-up covers the degraded path where /heartbeat's own warm-up failed.
-        await self._warm_goals_session_db("heartbeat poll")
+        """Wake each idle watched session once; leave busy sessions' ticks unclaimed."""
         for quick_key, (source, session_id) in list(watch.items()):
             try:
-                if quick_key in self._running_agents:
-                    continue  # busy sessions coalesce their tick to the next idle poll
-                from hermes_cli.heartbeat import HeartbeatManager
-
-                mgr = HeartbeatManager(session_id=session_id)
-                if not mgr.has_heartbeat():
-                    watch.pop(quick_key, None)
-                    continue
-                prompt = mgr.due_prompt()
-                adapter = self._adapter_for_source(source) if prompt else None
-                if adapter is not None:
-                    self._enqueue_fifo(quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                with self._profile_scope_for_source(source):
+                    await self._heartbeat_poll_watch(watch, quick_key, source, session_id)
             except Exception as exc:
                 logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+
+    async def _heartbeat_poll_watch(self, watch, quick_key, source, session_id):
+        await self._warm_goals_session_db("heartbeat poll")
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            current = store.peek_session_id(quick_key)
+            if not current:
+                watch.pop(quick_key, None)
+                return
+            session_id = current
+            watch[quick_key] = (source, session_id)
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not adapter._message_handler:
+            return
+        if (
+            self._is_session_running(quick_key)
+            or quick_key in adapter._active_sessions
+            or self._queue_depth(quick_key, adapter=adapter) > 0
+        ):
+            return  # keep missed intervals due until user work has drained
+        from hermes_cli.heartbeat import HeartbeatManager
+
+        mgr = HeartbeatManager(session_id=session_id)
+        if not mgr.has_heartbeat():
+            watch.pop(quick_key, None)
+            return
+        prompt = mgr.due_prompt()
+        if not prompt:
+            return
+        event = self._synthetic_prompt_event(source, prompt)
+        event.metadata["gateway_session_key"] = quick_key
+        event._heartbeat_execution_started = False
+        event._heartbeat_session_id = session_id
+        # A pinned route skips topic recovery: no await between the idle
+        # check and adapter claim. FIFO alone never wakes an idle session.
+        try:
+            await adapter.handle_message(event)
+        finally:
+            task = getattr(adapter, "_session_tasks", {}).get(quick_key)
+            if task is not None:
+                from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
+                task.add_done_callback(lambda done: settle_heartbeat_attempt(event, mgr))
+            elif quick_key not in adapter._active_sessions:
+                mgr.abandon_fire()
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -147,6 +177,8 @@ class GatewayGoalsMixin:
         async def _poll_loop():
             while True:
                 await asyncio.sleep(POLL_SECONDS)
+                from gateway.run_heartbeat_restore import restore_heartbeat_watches
+                await restore_heartbeat_watches(self)
                 watch = getattr(self, "_heartbeat_watch", None)
                 if watch:
                     await self._heartbeat_poll_once(watch)
@@ -241,10 +273,13 @@ class GatewayGoalsMixin:
         if mgr is None or not mgr.is_active():
             return
 
-        _bg_procs = None
+        _bg_procs, _active_deleg = None, 0
         with suppress(Exception):
-            from hermes_cli.goals import gather_background_processes as _gather_bg
-            _bg_procs = _gather_bg()
+            from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg
+            # Only THIS session's processes (gateway turns register under turn_ctx.session_id):
+            # subagents' pollers must not park the parent's goal.
+            _bg_procs = _gather_bg(owner_task_id=getattr(session_entry, "session_id", None) or None)
+            _active_deleg = count_active_delegations(getattr(session_entry, "session_id", None))
 
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
@@ -252,6 +287,7 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
+                active_delegations=_active_deleg,
             ),
         )
         msg = decision.get("message") or ""
@@ -337,7 +373,9 @@ class GatewayGoalsMixin:
         state = mgr.state if mgr is not None else None
         if state is None or not state.awaiting_response:
             return
-        # The --until judge is a sync aux-LLM call — keep it off the event loop.
+        # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
+        # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
+        # so a served secondary's tick would be written into the DEFAULT profile's state.db.
         decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
         msg = decision.get("message") or ""
         if msg and source is not None:
@@ -406,6 +444,7 @@ class GatewayGoalsMixin:
         if not platform_name or not chat_id:
             return  # CLI / TUI-owned loop — their own schedulers drive it.
 
+        profile = route_profile or scan_profile
         event_stub = {
             "session_key": "",
             "platform": platform_name,
@@ -417,7 +456,7 @@ class GatewayGoalsMixin:
                     "scope_id", "guild_id", "parent_chat_id",
                 )
             },
-            "profile": None if scan_profile == "default" else scan_profile,
+            "profile": None if profile == "default" else profile,
         }
         source = self._build_process_event_source(event_stub)
         if source is None:
@@ -437,29 +476,16 @@ class GatewayGoalsMixin:
         adapter = transport_owner[0] if transport_owner is not None else None
         if adapter is None:
             adapter_profile = str(route.get("adapter_profile") or "").strip()
-            if adapter_profile:
-                adapters = (
-                    self.adapters
-                    if adapter_profile == "default"
-                    else (getattr(self, "_profile_adapters", None) or {}).get(adapter_profile) or {}
-                )
-            elif profile_name is None:
-                adapters = self.adapters
-            else:
-                use_shared_adapters = False
-                with suppress(Exception):
-                    use_shared_adapters = self._profile_name_for_source(source) == profile_name
-                adapters = (
-                    self.adapters
-                    if use_shared_adapters
-                    else (getattr(self, "_profile_adapters", None) or {}).get(profile_name) or {}
-                )
+            # Persisted transport provenance wins over the routed runtime. With
+            # no provenance, use the shared resolver: it admits served satellites
+            # but never borrows the primary bot for a failed dedicated adapter.
+            adapters = self._adapters_for_profile(adapter_profile or profile)
             adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
         if adapter is None:
             if sid not in warned_no_route:
                 warned_no_route.add(sid)
                 logger.debug(
-                    "loop wakeup: no adapter for platform %r (session %s)", platform_name, sid,
+                    "loop wakeup: no adapter for platform %r (session %s, profile %s)", platform_name, sid, profile,
                 )
             return
 
@@ -537,31 +563,41 @@ class GatewayGoalsMixin:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
         (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.
         Deferrals: session running a turn (FIFO would race the live turn); active non-parked /goal
-        (goal owns the idle boundary); no routing metadata (one-time warning)."""
+        (goal owns the idle boundary); no routing metadata (one-time warning).
+
+        Multiplex: one gateway-wide task, so ``list_active_loops`` alone reads only the launch home's
+        store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
+        profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
+        and each hit is fired against that profile's adapters."""
+        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
         warned_foreign_scope: set = set()
+
+        def _scope(profile_home):
+            return (_async_profile_runtime_scope(profile_home) if profile_home is not None
+                    else nullcontext())
+
+        async def _scan_one_store(profile_name: Optional[str]) -> None:
+            from hermes_cli.loops import list_active_loops
+
+            # Warm once per scan: the scan reads every persisted loop and a cold cache would
+            # run the state.db init on the loop thread before the first read.
+            await self._warm_goals_session_db("loop wakeup")
+            # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
+            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            now = time.time()
+            for sid, state in active_loops:
+                await self._loop_wakeup_fire_one(
+                    sid, state, now, warned_no_route,
+                    warned_foreign_scope=warned_foreign_scope, profile_name=profile_name,
+                )
+
         while self._running:
             try:
-                from gateway.run import _handoff_watch_scopes, _profile_runtime_scope
-                from hermes_cli.loops import list_active_loops
-
-                async def _scan(scan_profile: str | None) -> None:
-                    await self._warm_goals_session_db("loop wakeup")
-                    active_loops = await self._run_in_executor_with_context(list_active_loops)
-                    now = time.time()
-                    for sid, state in active_loops:
-                        await self._loop_wakeup_fire_one(
-                            sid, state, now, warned_no_route,
-                            warned_foreign_scope, scan_profile,
-                        )
-
-                for scan_profile, profile_home in _handoff_watch_scopes(self):
-                    if profile_home is None:
-                        await _scan(scan_profile)
-                    else:
-                        with _profile_runtime_scope(profile_home):
-                            await _scan(scan_profile)
+                for profile_name, profile_home in _handoff_watch_scopes(self):
+                    async with _scope(profile_home):
+                        await _scan_one_store(profile_name)
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
