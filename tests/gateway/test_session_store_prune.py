@@ -14,13 +14,15 @@ tests pin the prune behaviour:
     (so a long-running-but-still-active session isn't pruned)
 """
 
+import gc
 import json
 import threading
+import weakref
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionEntry, SessionStore
 
 
@@ -31,7 +33,7 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     hermes_state before a fixture redirected HERMES_HOME used to pin every
     default SessionDB() at the developer's real ~/.hermes/state.db.
     """
-    config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="none"))
+    config = GatewayConfig()
     fake_home = tmp_path / "alt_hermes_home"
     fake_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
@@ -50,7 +52,7 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
 def _make_store(tmp_path, max_age_days: int = 90, has_active_processes_fn=None):
     """Build a SessionStore bypassing SQLite/disk-load side effects."""
     config = GatewayConfig(
-        default_reset_policy=SessionResetPolicy(mode="none"),
+
         session_store_max_age_days=max_age_days,
     )
     with patch("gateway.session.SessionStore._ensure_loaded"):
@@ -183,12 +185,61 @@ class TestPruneBasics:
             if i % 2 == 1:  # fresh
                 assert f"s{i}" in store._entries
 
+    def test_prune_reclaims_route_locks_without_splitting_live_same_key_lock(
+        self, tmp_path
+    ):
+        store = _make_store(tmp_path)
+        lock_refs = []
+        route_count = 256
+        for index in range(route_count):
+            key = f"stale-{index}"
+            store._entries[key] = _entry(key, age_days=1000)
+            lock = store._rotation_lock_for_key(key)
+            lock_refs.append(weakref.ref(lock))
+
+        removed = store.prune_old_entries(max_age_days=90)
+        del lock
+        gc.collect()
+        idle_locks_reclaimed = all(ref() is None for ref in lock_refs)
+
+        shared = store._rotation_lock_for_key("shared-route")
+        shared_ref = weakref.ref(shared)
+        shared.acquire()
+        identities = []
+        overlapping_acquires = []
+
+        def _try_same_key():
+            candidate = store._rotation_lock_for_key("shared-route")
+            identities.append(candidate is shared)
+            acquired = candidate.acquire(blocking=False)
+            overlapping_acquires.append(acquired)
+            if acquired:
+                candidate.release()
+
+        threads = [threading.Thread(target=_try_same_key) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        shared.release()
+
+        assert removed == route_count
+        assert idle_locks_reclaimed is True
+        assert identities == [True] * len(threads)
+        assert overlapping_acquires == [False] * len(threads)
+
+        del shared
+        gc.collect()
+        assert shared_ref() is None
+        assert len(store._rotation_locks) == 0
+
 
 class TestPrunePersistsToDisk:
     def test_prune_rewrites_sessions_json(self, tmp_path):
         """After prune, sessions.json on disk reflects the new dict."""
         config = GatewayConfig(
-            default_reset_policy=SessionResetPolicy(mode="none"),
+
             session_store_max_age_days=90,
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -258,4 +309,3 @@ class TestReadmeSentinel:
         # The note points users at the real store and command.
         assert "state.db" in raw["_README"]
         assert "hermes sessions list" in raw["_README"]
-
